@@ -262,15 +262,21 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
+
+        binary_loss = binarization_loss(masks[0]) * 2e1
+        # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         ms = masks[0].size()
         min_fg_cvg = 0.2 * ms[2] * ms[3]
-        # recon_loss = F.mse_loss(self.recon_mk, fg_mk) * 10
-        binary_loss = binarization_loss(masks[0]) * 2e1
-        # conc_loss = self.concentration_loss(fg_mk, bg_mk) * 0
-        # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[0], dim=(-1,-2))).mean() * 1e-2
 
-        generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss
+        ms = masks[1].size()
+        min_bg_cvg = 0.2 * ms[2] * ms[3]
+        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 1e-2
+
+        loss_dict["bin"] = binary_loss
+        loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
+
+        generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
@@ -318,6 +324,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         g_loss_val = loss_reduced["g"].mean().item()
         p_info_loss_val = loss_reduced["p_info"].mean().item()
         c_info_loss_val = loss_reduced["c_info"].mean().item()
+        binary_loss_val = loss_reduced["bin"].mean().item()
+        cvg_loss_val = loss_reduced["cvg"].mean().item()
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
@@ -329,6 +337,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                 (
                     f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
                     f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
+                    f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
                     f"augment: {ada_aug_p:.4f}"
                 )
