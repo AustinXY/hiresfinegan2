@@ -42,7 +42,7 @@ def resize_worker(img_file, sizes, resample):
 
 def prepare(
     env, dataset, n_worker, sizes=(128, 256, 512, 1024), resample=Image.LANCZOS
-):
+    ):
     resize_fn = partial(resize_worker, sizes=sizes, resample=resample)
 
     files = sorted(dataset.imgs, key=lambda x: x[0])

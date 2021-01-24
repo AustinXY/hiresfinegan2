@@ -86,9 +86,13 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
-    grad, = autograd.grad(
-        outputs=(fake_img * noise).sum(), inputs=latents, create_graph=True
+    grad_bg, = autograd.grad(
+        outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
     )
+    grad_fg, = autograd.grad(
+        outputs=(fake_img * noise).sum(), inputs=latents[1], create_graph=True
+    )
+    grad = grad_bg + grad_fg
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
@@ -120,8 +124,17 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
+def sample_c_code(batch, c_categories, device):
+    c_code = torch.zeros(batch, c_categories).to(device)
+    cid = np.random.randint(c_categories, size=batch)
+    for i in range(batch):
+        c_code[i, cid[i]] = 1
+    return c_code
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def binarization_loss(mask):
+    return torch.min(1-mask, mask).mean()
+
+def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -141,11 +154,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
     if args.distributed:
         g_module = generator.module
-        d_module = discriminator.module
+        d_module1 = netsD[1].module
+        d_module2 = netsD[2].module
 
     else:
         g_module = generator
-        d_module = discriminator
+        d_module1 = netsD[1]
+        d_module2 = netsD[2]
 
     accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
@@ -156,6 +171,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
+    criterion_class = nn.CrossEntropyLoss()
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -167,30 +183,34 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         real_img = next(loader)
         real_img = real_img.to(device)
 
+        ############# train child discriminator #############
         requires_grad(generator, False)
-        requires_grad(discriminator, True)
+        requires_grad(netsD[2], True)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        c_code = sample_c_code(args.batch, args.c_categories, device)
+        # fake_img, _ = generator(noise, c_code)
+        image_li, _, _ = generator(noise, c_code)
+        fake_img = image_li[0]
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
             fake_img, _ = augment(fake_img, ada_aug_p)
-
         else:
             real_img_aug = real_img
 
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
+        fake_pred = netsD[2](fake_img)[0]
+        real_pred = netsD[2](real_img)[0]
+
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict["d"] = d_loss
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
 
-        discriminator.zero_grad()
+        netsD[2].zero_grad()
         d_loss.backward()
-        d_optim.step()
+        rf_opt[2].step()
 
         if args.augment and args.augment_p == 0:
             ada_aug_p = ada_augment.tune(real_pred)
@@ -200,40 +220,74 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if d_regularize:
             real_img.requires_grad = True
-            real_pred = discriminator(real_img)
+            real_pred = netsD[2](real_img)[0]
             r1_loss = d_r1_loss(real_pred, real_img)
 
-            discriminator.zero_grad()
+            netsD[2].zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
 
-            d_optim.step()
+            rf_opt[2].step()
 
         loss_dict["r1"] = r1_loss
 
+
+        ############# train generator and info discriminator #############
         requires_grad(generator, True)
-        requires_grad(discriminator, False)
+        requires_grad(netsD[1], True)
+        requires_grad(netsD[2], True)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        c_code = sample_c_code(args.batch, args.c_categories, device)
+        image_li, code_li, _ = generator(noise, c_code)
+        fake_img = image_li[0]
+        mkd_images = image_li[2]
+        masks = image_li[3]
+        p_code = code_li[1]
+        c_code = code_li[2]
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
+        fake_pred = netsD[2](fake_img)[0]
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
 
+        pred_p = netsD[1](mkd_images[1])[1]
+        p_info_loss = criterion_class(pred_p, torch.nonzero(p_code.long(), as_tuple=False)[:,1])
+
+        pred_c = netsD[2](mkd_images[2])[1]
+        c_info_loss = criterion_class(pred_c, torch.nonzero(c_code.long(), as_tuple=False)[:,1])
+
+        loss_dict["p_info"] = p_info_loss
+        loss_dict["c_info"] = c_info_loss
+
+        ms = masks[0].size()
+        min_fg_cvg = 0.2 * ms[2] * ms[3]
+        # recon_loss = F.mse_loss(self.recon_mk, fg_mk) * 10
+        binary_loss = binarization_loss(masks[0]) * 2e1
+        # conc_loss = self.concentration_loss(fg_mk, bg_mk) * 0
+        # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
+        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[0], dim=(-1,-2))).mean() * 1e-2
+
+        generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss
+
         generator.zero_grad()
-        g_loss.backward()
+        netsD[1].zero_grad()
+        netsD[2].zero_grad()
+        generator_loss.backward()
         g_optim.step()
+        info_opt[1].step()
+        info_opt[2].step()
 
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
-            fake_img, latents = generator(noise, return_latents=True)
+            c_code = sample_c_code(path_batch_size, args.c_categories, device)
+            image_li, _, latents = generator(noise, c_code, return_latents=True)
+            fake_img = image_li[0]
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -262,6 +316,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
+        p_info_loss_val = loss_reduced["p_info"].mean().item()
+        c_info_loss_val = loss_reduced["c_info"].mean().item()
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
@@ -272,6 +328,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             pbar.set_description(
                 (
                     f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
+                    f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
                     f"augment: {ada_aug_p:.4f}"
                 )
@@ -293,26 +350,53 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    c_code = sample_c_code(args.n_sample, args.c_categories, device)
+                    image_li, _, _ = g_ema([sample_z], c_code)
+                    fnl_image = image_li[0]
+                    mkd_images = image_li[2]
+                    masks = image_li[3]
+
                     utils.save_image(
-                        sample,
-                        f"sample/{str(i).zfill(6)}.png",
+                        fnl_image,
+                        f"sample/{str(i).zfill(6)}_0.png",
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
                         range=(-1, 1),
                     )
 
-            if i % 10000 == 0:
+                    for j in range(3):
+                        utils.save_image(
+                            mkd_images[j],
+                            f"sample/{str(i).zfill(6)}_{str(1+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(-1, 1),
+                        )
+
+                    for j in range(2):
+                        utils.save_image(
+                            masks[j],
+                            f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(-1, 1),
+                        )
+
+            if i % 50000 == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
-                        "d": d_module.state_dict(),
+                        # "d0": d_module0.state_dict(),
+                        "d1": d_module1.state_dict(),
+                        "d2": d_module2.state_dict(),
                         "g_ema": g_ema.state_dict(),
                         "g_optim": g_optim.state_dict(),
-                        "d_optim": d_optim.state_dict(),
+                        "rf_optim": info_opt[2].state_dict(),
+                        "info_optim1": info_opt[1].state_dict(),
+                        "info_optim2": info_opt[2].state_dict(),
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
@@ -335,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_sample",
         type=int,
-        default=64,
+        default=16,
         help="number of the samples generated during training",
     )
     parser.add_argument(
@@ -417,7 +501,30 @@ if __name__ == "__main__":
         default=256,
         help="probability update interval of the adaptive augmentation",
     )
-
+    parser.add_argument(
+        "--b_categories",
+        type=int,
+        default=200,
+        help="number of background categories",
+    )
+    parser.add_argument(
+        "--p_categories",
+        type=int,
+        default=20,
+        help="number of parent categories",
+    )
+    parser.add_argument(
+        "--c_categories",
+        type=int,
+        default=200,
+        help="number of child categories",
+    )
+    parser.add_argument(
+        "--p_size",
+        type=int,
+        default=64,
+        help="parent output size",
+    )
     args = parser.parse_args()
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -433,17 +540,31 @@ if __name__ == "__main__":
 
     args.start_iter = 0
 
+    if args.n_sample == 0:
+        args.n_sample = args.batch
+
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
+        args.p_size, channel_multiplier=args.channel_multiplier
     ).to(device)
-    discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier
-    ).to(device)
+
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
+        args.p_size, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
+
+    # netD0 = Discriminator(
+    #     args.size, args.b_categories, channel_multiplier=args.channel_multiplier
+    # ).to(device)
+    netD1 = Discriminator(
+        args.p_size, args.p_categories, channel_multiplier=args.channel_multiplier
+    ).to(device)
+    netD2 = Discriminator(
+        args.size, args.c_categories, channel_multiplier=args.channel_multiplier
+    ).to(device)
+    netsD = [None, netD1, netD2]
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -453,11 +574,30 @@ if __name__ == "__main__":
         lr=args.lr * g_reg_ratio,
         betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
-    d_optim = optim.Adam(
-        discriminator.parameters(),
+    # d_optim0 = optim.Adam(
+    #     netD0.parameters(),
+    #     lr=args.lr * d_reg_ratio,
+    #     betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
+    # )
+
+    d_optim2 = optim.Adam(
+        netD2.parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
+    rf_opt = [None, None, d_optim2]
+
+    info_optim1 = optim.Adam(
+        netD1.parameters(),
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
+    )
+    info_optim2 = optim.Adam(
+        netD2.pred_linear.parameters(),
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
+    )
+    info_opt = [None, info_optim1, info_optim2]
 
     if args.ckpt is not None:
         print("load model:", args.ckpt)
@@ -467,16 +607,21 @@ if __name__ == "__main__":
         try:
             ckpt_name = os.path.basename(args.ckpt)
             args.start_iter = int(os.path.splitext(ckpt_name)[0])
-
         except ValueError:
             pass
 
         generator.load_state_dict(ckpt["g"])
-        discriminator.load_state_dict(ckpt["d"])
+        # netsD[0].load_state_dict(ckpt["d0"])
+        netsD[1].load_state_dict(ckpt["d1"])
+        netsD[2].load_state_dict(ckpt["d2"])
         g_ema.load_state_dict(ckpt["g_ema"])
 
         g_optim.load_state_dict(ckpt["g_optim"])
-        d_optim.load_state_dict(ckpt["d_optim"])
+        # optD[0].load_state_dict(ckpt["d_optim0"])
+        info_opt[2].load_state_dict(ckpt["rf_optim2"])
+
+        info_opt[1].load_state_dict(ckpt["info_optim1"])
+        info_opt[2].load_state_dict(ckpt["info_optim2"])
 
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
@@ -486,8 +631,20 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-        discriminator = nn.parallel.DistributedDataParallel(
-            discriminator,
+        # netsD[0] = nn.parallel.DistributedDataParallel(
+        #     netsD[0],
+        #     device_ids=[args.local_rank],
+        #     output_device=args.local_rank,
+        #     broadcast_buffers=False,
+        # )
+        netsD[1] = nn.parallel.DistributedDataParallel(
+            netsD[1],
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
+        netsD[2] = nn.parallel.DistributedDataParallel(
+            netsD[2],
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
@@ -512,4 +669,4 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
