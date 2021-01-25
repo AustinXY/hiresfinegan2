@@ -86,13 +86,10 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
-    grad_bg, = autograd.grad(
-        outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
+    grad, = autograd.grad(
+        outputs=(fake_img * noise).sum(), inputs=latents, create_graph=True
     )
-    grad_fg, = autograd.grad(
-        outputs=(fake_img * noise).sum(), inputs=latents[1], create_graph=True
-    )
-    grad = grad_bg + grad_fg
+
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)

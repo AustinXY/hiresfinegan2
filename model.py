@@ -355,29 +355,17 @@ class Stage_Generator(nn.Module):
         self,
         size,
         style_dim,
-        n_mlp,
         code0_len=0,
         code1_len=0,
         stage0_depth=-1,
         channel_multiplier=2,
         blur_kernel=[1, 3, 3, 1],
-        lr_mlp=0.01
         ):
         super().__init__()
 
         self.size = size
         self.stage0_depth = stage0_depth
         self.style_dim = style_dim
-        layers = [PixelNorm()]
-
-        for i in range(n_mlp):
-            layers.append(
-                EqualLinear(
-                    style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
-                )
-            )
-
-        self.style = nn.Sequential(*layers)
 
         code_channels = []
         for i in range(0, 9):
@@ -456,33 +444,25 @@ class Stage_Generator(nn.Module):
 
         return noises
 
-    def mean_latent(self, n_latent):
-        latent_in = torch.randn(
-            n_latent, self.style_dim, device=self.input.input.device
-        )
-        latent = self.style(latent_in).mean(0, keepdim=True)
+    # def mean_latent(self, n_latent):
+    #     latent_in = torch.randn(
+    #         n_latent, self.style_dim, device=self.input.input.device
+    #     )
+    #     latent = self.style(latent_in).mean(0, keepdim=True)
 
-        return latent
+    #     return latent
 
     def get_latent(self, input):
         return self.style(input)
 
     def forward(
         self,
-        styles,
+        latent,
         code0,
         code1,
-        return_latents=False,
-        inject_index=None,
-        truncation=1,
-        truncation_latent=None,
-        input_is_latent=False,
         noise=None,
         randomize_noise=True,
         ):
-
-        if not input_is_latent:
-            styles = [self.style(s) for s in styles]
 
         if noise is None:
             if randomize_noise:
@@ -491,33 +471,6 @@ class Stage_Generator(nn.Module):
                 noise = [
                     getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
                 ]
-
-        if truncation < 1:
-            style_t = []
-
-            for style in styles:
-                style_t.append(
-                    truncation_latent + truncation * (style - truncation_latent)
-                )
-
-            styles = style_t
-
-        if len(styles) < 2:
-            inject_index = self.n_latent
-
-            if styles[0].ndim < 3:
-                latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-            else:
-                latent = styles[0]
-
-        else:
-            if inject_index is None:
-                inject_index = random.randint(1, self.n_latent - 1)
-
-            latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-            latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
-
-            latent = torch.cat([latent, latent2], 1)
 
         skip_li = []
 
@@ -555,10 +508,7 @@ class Stage_Generator(nn.Module):
 
             i += 2
 
-        if return_latents:
-            return skip_li, latent
-        else:
-            return skip_li, None
+        return skip_li
 
 
 class Generator(nn.Module):
@@ -576,6 +526,18 @@ class Generator(nn.Module):
         lr_mlp=0.01,
     ):
         super().__init__()
+
+        layers = [PixelNorm()]
+
+        for _ in range(n_mlp):
+            layers.append(
+                EqualLinear(
+                    style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
+                )
+            )
+
+        self.style = nn.Sequential(*layers)
+
         if b_categories is None:
             b_categories = c_categories
 
@@ -587,14 +549,14 @@ class Generator(nn.Module):
 
         self.p_depth = int(math.log(p_size, 2)) - 2
 
-        self.bg_generator = Stage_Generator(size, style_dim, n_mlp, code1_len=self.b_categories,
-            channel_multiplier=channel_multiplier, blur_kernel=blur_kernel, lr_mlp=lr_mlp)
-        self.fg_generator = Stage_Generator(size, style_dim, n_mlp, code0_len=p_categories,
+        self.bg_generator = Stage_Generator(size, style_dim, code1_len=self.b_categories,
+            channel_multiplier=channel_multiplier, blur_kernel=blur_kernel)
+        self.fg_generator = Stage_Generator(size, style_dim, code0_len=p_categories,
             code1_len=c_categories, stage0_depth=self.p_depth, channel_multiplier=channel_multiplier,
-            blur_kernel=blur_kernel, lr_mlp=lr_mlp)
+            blur_kernel=blur_kernel)
 
         self.log_size = int(math.log(size, 2))
-        # self.num_layers = (self.log_size - 2) * 2 + 1
+        self.num_layers = (self.log_size - 2) * 2 + 1
         self.n_latent = self.log_size * 2 - 2
 
 
@@ -623,17 +585,43 @@ class Generator(nn.Module):
         randomize_noise=True,
         ):
 
+        if not input_is_latent:
+            styles = [self.style(s) for s in styles]
+
+        if truncation < 1:
+            style_t = []
+
+            for style in styles:
+                style_t.append(
+                    truncation_latent + truncation * (style - truncation_latent)
+                )
+
+            styles = style_t
+
+        if len(styles) < 2:
+            inject_index = self.n_latent
+
+            if styles[0].ndim < 3:
+                latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
+            else:
+                latent = styles[0]
+
+        else:
+            if inject_index is None:
+                inject_index = random.randint(1, self.n_latent - 1)
+
+            latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
+            latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
+
+            latent = torch.cat([latent, latent2], 1)
+
         if tied_code:
             p_code = self.child_to_parent(c_code)
             b_code = c_code
 
-        bg_skip_li, bg_latent = self.bg_generator(styles, None, b_code, return_latents=return_latents,
-            inject_index=inject_index, truncation=truncation, truncation_latent=truncation_latent,
-            input_is_latent=input_is_latent, noise=noise, randomize_noise=randomize_noise)
+        bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
 
-        fg_skip_li, fg_latent = self.fg_generator(styles, p_code, c_code, return_latents=return_latents,
-            inject_index=inject_index, truncation=truncation, truncation_latent=truncation_latent,
-            input_is_latent=input_is_latent, noise=noise, randomize_noise=randomize_noise)
+        fg_skip_li = self.fg_generator(latent, p_code, c_code, noise=noise, randomize_noise=randomize_noise)
 
         b_skip = bg_skip_li[-1]
         p_skip = fg_skip_li[self.p_depth]
@@ -656,7 +644,7 @@ class Generator(nn.Module):
         masks = [p_mask, c_mask]
 
         if return_latents:
-            return [fnl_image, raw_images, mkd_images, masks], [b_code, p_code, c_code], [bg_latent, fg_latent]
+            return [fnl_image, raw_images, mkd_images, masks], [b_code, p_code, c_code], latent
         else:
             return [fnl_image, raw_images, mkd_images, masks], [b_code, p_code, c_code], None
 
