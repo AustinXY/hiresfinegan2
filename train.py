@@ -262,12 +262,11 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
-
-        binary_loss = binarization_loss(masks[0]) * 2e1
+        binary_loss = binarization_loss(masks[1]) * 2e1
         # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
-        ms = masks[0].size()
+        ms = masks[1].size()
         min_fg_cvg = 0.2 * ms[2] * ms[3]
-        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[0], dim=(-1,-2))).mean() * 1e-2
+        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 1e-2
 
         ms = masks[1].size()
         min_bg_cvg = 0.2 * ms[2] * ms[3]
@@ -348,6 +347,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     {
                         "Generator": g_loss_val,
                         "Discriminator": d_loss_val,
+                        "p_info": p_info_loss_val,
+                        "c_info": c_info_loss_val,
                         "Augment": ada_aug_p,
                         "Rt": r_t_stat,
                         "R1": r1_val,
@@ -364,12 +365,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     g_ema.eval()
                     c_code = sample_c_code(args.n_sample, args.c_categories, device)
                     image_li, _, _ = g_ema([sample_z], c_code)
-                    fnl_image = image_li[0]
-                    mkd_images = image_li[2]
-                    masks = image_li[3]
 
                     utils.save_image(
-                        fnl_image,
+                        image_li[0],
                         f"sample/{str(i).zfill(6)}_0.png",
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
@@ -378,8 +376,17 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
                     for j in range(3):
                         utils.save_image(
-                            mkd_images[j],
+                            image_li[1][j],
                             f"sample/{str(i).zfill(6)}_{str(1+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(-1, 1),
+                        )
+
+                    for j in range(3):
+                        utils.save_image(
+                            image_li[2][j],
+                            f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
                             nrow=int(args.n_sample ** 0.5),
                             normalize=True,
                             range=(-1, 1),
@@ -387,14 +394,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
                     for j in range(2):
                         utils.save_image(
-                            masks[j],
-                            f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
+                            image_li[3][j],
+                            f"sample/{str(i).zfill(6)}_{str(7+j)}.png",
                             nrow=int(args.n_sample ** 0.5),
                             normalize=True,
-                            range=(-1, 1),
+                            range=(0, 1),
                         )
 
-            if i % 50000 == 0:
+            if i % 10000 == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -403,7 +410,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         "d2": d_module2.state_dict(),
                         "g_ema": g_ema.state_dict(),
                         "g_optim": g_optim.state_dict(),
-                        "rf_optim": info_opt[2].state_dict(),
+                        "rf_optim2": rf_opt[2].state_dict(),
                         "info_optim1": info_opt[1].state_dict(),
                         "info_optim2": info_opt[2].state_dict(),
                         "args": args,
@@ -590,19 +597,19 @@ if __name__ == "__main__":
     # )
 
     d_optim2 = optim.Adam(
-        netD2.parameters(),
+        netsD[2].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     rf_opt = [None, None, d_optim2]
 
     info_optim1 = optim.Adam(
-        netD1.parameters(),
+        netsD[1].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     info_optim2 = optim.Adam(
-        netD2.pred_linear.parameters(),
+        netsD[2].pred_linear.parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
@@ -627,7 +634,7 @@ if __name__ == "__main__":
 
         g_optim.load_state_dict(ckpt["g_optim"])
         # optD[0].load_state_dict(ckpt["d_optim0"])
-        info_opt[2].load_state_dict(ckpt["rf_optim2"])
+        rf_opt[2].load_state_dict(ckpt["rf_optim"])
 
         info_opt[1].load_state_dict(ckpt["info_optim1"])
         info_opt[2].load_state_dict(ckpt["info_optim2"])
@@ -674,6 +681,7 @@ if __name__ == "__main__":
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
     )
+
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
