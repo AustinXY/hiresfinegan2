@@ -760,7 +760,6 @@ class Discriminator(nn.Module):
             EqualLinear(channels[4], pred_len),
         )
 
-
     def forward(self, input):
         out = self.convs(input)
 
@@ -782,3 +781,111 @@ class Discriminator(nn.Module):
 
         return [rf_score, code_pred]
 
+
+#################### bg discriminator #################
+class MnetConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=False):
+        super().__init__()
+        self.input_conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+        self.mask_conv = nn.Conv2d(
+            1, 1, kernel_size, stride, padding, dilation, groups, False)
+
+        # mask is not updated
+        for param in self.mask_conv.parameters():
+            param.requires_grad = False
+
+    def forward(self, input, mask):
+        """
+        input is regular tensor with shape N*C*H*W
+        mask has to have 1 channel N*1*H*W
+        """
+        output = self.input_conv(input)
+        if mask is not None:
+            mask = self.mask_conv(mask)
+        return output, mask
+
+
+class downBlock_mnet(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, dilation=1, groups=1, bias=False):
+        super().__init__()
+        self.conv = MnetConv(in_channels, out_channels,
+                             kernel_size, stride, padding, dilation, groups, bias)
+        # self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, input, mask=None):
+        """
+        input is regular tensor with shape N*C*H*W
+        mask has to have 1 channel N*1*H*W
+        """
+        output, mask = self.conv(input, mask)
+        # output = self.bn(output)
+        output = F.leaky_relu(output, 0.2, inplace=True)
+        output = F.avg_pool2d(output, 2)
+        if mask is not None:
+            mask = F.avg_pool2d(mask, 2)
+        return output, mask
+
+
+def fromRGB_layer(out_planes):
+    layer = nn.Sequential(
+        nn.Conv2d(3, out_planes, 1, 1, 0, bias=False),
+        nn.LeakyReLU(0.2, inplace=True)
+    )
+    return layer
+
+
+class D_NET_BG_BASE(nn.Module):
+    def __init__(self, ndf):
+        super().__init__()
+        self.df_dim = ndf
+        self.define_module()
+
+    def define_module(self):
+        ndf = self.df_dim
+        self.conv = MnetConv(ndf, ndf * 2, 3, 1, 1)
+        self.conv_uncond_logits1 = MnetConv(ndf * 2, 1, 3, 1, 1)
+        self.conv_uncond_logits2 = MnetConv(ndf * 2, 1, 3, 1, 1)
+
+    def forward(self, x_code, mask):
+        x_code, mask = self.conv(x_code, mask)
+        x_code = F.leaky_relu(x_code, 0.2, inplace=True)
+        _x_code, _mask = self.conv_uncond_logits1(x_code, mask)
+        classi_score = torch.sigmoid(_x_code)
+        _x_code, _mask = self.conv_uncond_logits2(x_code, mask)
+        rf_score = torch.sigmoid(_x_code)
+        return [classi_score, rf_score], _mask
+
+
+class D_NET_BG(nn.Module):
+    def __init__(self, start_depth):
+        super().__init__()
+        self.df_dim = 256
+        self.start_depth = start_depth
+        self.define_module()
+
+    def define_module(self):
+        ndf = self.df_dim
+        self.from_RGB_net = nn.ModuleList([fromRGB_layer(ndf)])
+        self.down_net = nn.ModuleList([D_NET_BG_BASE(ndf)])
+        ndf = ndf // 2
+        for _ in range(self.start_depth):
+            self.from_RGB_net.append(fromRGB_layer(ndf))
+            self.down_net.append(downBlock_mnet(ndf, ndf * 2, 3, 1, 1))
+            ndf = ndf // 2
+
+        self.df_dim = ndf
+        self.cur_depth = self.start_depth
+
+    def forward(self, x_var, alpha=None, mask=None):
+        x_code = self.from_RGB_net[self.cur_depth](x_var)
+        for i in range(self.cur_depth, -1, -1):
+            x_code, mask = self.down_net[i](x_code, mask)
+            if i == self.cur_depth and i != self.start_depth and alpha < 1:
+                y_var = F.avg_pool2d(x_var, 2)
+                y_code = self.from_RGB_net[i-1](y_var)
+                x_code = (1 - alpha) * y_code + alpha * x_code
+
+        classi_score = x_code[0]
+        rf_score = x_code[1]
+        return [rf_score, classi_score, mask]

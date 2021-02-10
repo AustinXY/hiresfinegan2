@@ -11,6 +11,7 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
+from prepare_data import IMIM
 
 try:
     import wandb
@@ -18,7 +19,7 @@ try:
 except ImportError:
     wandb = None
 
-from model import Generator, Discriminator
+from model import Generator, Discriminator, D_NET_BG
 from dataset import MultiResolutionDataset
 from distributed import (
     get_rank,
@@ -29,6 +30,19 @@ from distributed import (
 )
 from non_leaking import augment, AdaptiveAugment
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    if isinstance(m, nn.Conv2d):
+        nn.init.orthogonal(m.weight.data, 1.0)
+    elif isinstance(m, nn.BatchNorm2d):
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+    elif isinstance(m, nn.Linear):
+        nn.init.orthogonal(m.weight.data, 1.0)
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)
+    elif classname == 'MnetConv':
+        nn.init.constant_(m.mask_conv.weight.data, 1)
 
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
@@ -151,11 +165,13 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
     if args.distributed:
         g_module = generator.module
+        d_module0 = netsD[0].module
         d_module1 = netsD[1].module
         d_module2 = netsD[2].module
 
     else:
         g_module = generator
+        d_module0 = netsD[0]
         d_module1 = netsD[1]
         d_module2 = netsD[2]
 
@@ -169,6 +185,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
     criterion_class = nn.CrossEntropyLoss()
+    criterion = nn.BCELoss(reduction='none')
+    criterion_one = nn.BCELoss()
+
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -177,24 +196,79 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
             break
 
-        real_img = next(loader)
+        real_img, mask = next(loader)
         real_img = real_img.to(device)
+        mask = mask.to(device)
 
-        ############# train child discriminator #############
+        ############# train bg discriminator #############
         requires_grad(generator, False)
-        requires_grad(netsD[2], True)
+        # requires_grad(netsD[0], True)
+        requires_grad(netsD[1], False)
+        requires_grad(netsD[2], False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         c_code = sample_c_code(args.batch, args.c_categories, device)
-        # fake_img, _ = generator(noise, c_code)
         image_li, _, _ = generator(noise, c_code)
         fake_img = image_li[0]
 
-        if args.augment:
-            real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
+        real_logits = netsD[0](real_img, mask=mask)
+
+        rf_scores, _, fnl_masks = real_logits
+        weights_real = torch.ones_like(rf_scores)
+
+        invalid_patch = fnl_masks != 0.0
+        weights_real.masked_fill_(invalid_patch, 0.0)
+
+        real_labels = torch.ones_like(rf_scores)
+
+        errD_real_uncond = criterion(real_logits[0], real_labels)  # Real/Fake loss for 'real background' (on patch level)
+        errD_real_uncond = torch.mul(errD_real_uncond, weights_real)  # Masking output units which correspond to receptive fields which lie within the boundin box
+        errD_real_uncond = errD_real_uncond.mean()
+
+        errD_real_uncond_classi = criterion(real_logits[1], weights_real)  # Background/foreground classification loss
+        errD_real_uncond_classi = errD_real_uncond_classi.mean()
+
+        fake_logits = netsD[0](fake_img, mask=None)
+
+        fake_labels = torch.zeros_like(fake_logits[0])
+
+        errD_fake_uncond = criterion(fake_logits[0], fake_labels)  # Real/Fake loss for 'fake background' (on patch level)
+        errD_fake_uncond = errD_fake_uncond.mean()
+
+        norm_fact_real = weights_real.sum()
+        norm_fact_fake = weights_real.shape[0]*weights_real.shape[1]*weights_real.shape[2]*weights_real.shape[3]
+
+        if norm_fact_real > 0:    # Normalizing the real/fake loss for background after accounting the number of masked members in the output.
+            errD_real = errD_real_uncond * ((norm_fact_fake * 1.0) /(norm_fact_real * 1.0))
         else:
-            real_img_aug = real_img
+            errD_real = errD_real_uncond
+
+        errD_fake = errD_fake_uncond
+        errD = ((errD_real + errD_fake) * 10) + errD_real_uncond_classi
+
+        loss_dict["d0"] = errD
+
+        netsD[0].zero_grad()
+        errD.backward()
+        rf_opt[0].step()
+
+
+        ############# train child discriminator #############
+        requires_grad(generator, False)
+        # requires_grad(netsD[0], False)
+        requires_grad(netsD[1], False)
+        requires_grad(netsD[2], True)
+
+        # noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        # c_code = sample_c_code(args.batch, args.c_categories, device)
+        # image_li, _, _ = generator(noise, c_code)
+        # fake_img = image_li[0]
+
+        # if args.augment:
+        #     real_img_aug, _ = augment(real_img, ada_aug_p)
+        #     fake_img, _ = augment(fake_img, ada_aug_p)
+        # else:
+        #     real_img_aug = real_img
 
         fake_pred = netsD[2](fake_img)[0]
         real_pred = netsD[2](real_img)[0]
@@ -228,8 +302,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["r1"] = r1_loss
 
 
-        ############# train generator and info discriminator #############
+        ############# train generator #############
         requires_grad(generator, True)
+        # requires_grad(netsD[0], False)
         requires_grad(netsD[1], True)
         requires_grad(netsD[2], True)
 
@@ -245,11 +320,22 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
+        # background rf
+        output = netsD[0](fake_img)
+        real_labels = torch.ones_like(output[0])
+        g_bg_loss = criterion_one(output[0], real_labels) * 10
+        errG_classi = criterion_one(output[1], real_labels) # Background/Foreground classification loss for the fake background image (on patch level)
+        g_bg_loss += errG_classi
+
+        loss_dict["g_bg"] = g_bg_loss
+
+        # child rf
         fake_pred = netsD[2](fake_img)[0]
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
 
+        # parent, child info
         pred_p = netsD[1](mkd_images[1])[1]
         p_info_loss = criterion_class(pred_p, torch.nonzero(p_code.long(), as_tuple=False)[:,1])
 
@@ -259,22 +345,23 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
-        binary_loss = binarization_loss(masks[1]) * 2e1
+        binary_loss = binarization_loss(masks[1]) * 0
         # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         ms = masks[1].size()
         min_fg_cvg = 0.2 * ms[2] * ms[3]
-        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 1e-2
+        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 0
 
         ms = masks[1].size()
         min_bg_cvg = 0.2 * ms[2] * ms[3]
-        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 1e-2
+        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 0
 
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
+        # netsD[0].zero_grad()
         netsD[1].zero_grad()
         netsD[2].zero_grad()
         generator_loss.backward()
@@ -317,7 +404,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_reduced = reduce_loss_dict(loss_dict)
 
         d_loss_val = loss_reduced["d"].mean().item()
+        d0_loss_val = loss_reduced["d0"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
+        g_bg_loss_val = loss_reduced["g_bg"].mean().item()
         p_info_loss_val = loss_reduced["p_info"].mean().item()
         c_info_loss_val = loss_reduced["c_info"].mean().item()
         binary_loss_val = loss_reduced["bin"].mean().item()
@@ -331,10 +420,10 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
+                    f"d: {d_loss_val:.4f}; d0: {d0_loss_val:.4f}; g: {g_loss_val:.4f}; g_bg: {g_bg_loss_val:.4f}; "
                     f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
                     f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
-                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
+                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f};  r1: {r1_val:.4f};"
                     f"augment: {ada_aug_p:.4f}"
                 )
             )
@@ -344,6 +433,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     {
                         "Generator": g_loss_val,
                         "Discriminator": d_loss_val,
+                        "BG_Generator": g_bg_loss_val,
+                        "BG_Discriminator": d0_loss_val,
                         "p_info": p_info_loss_val,
                         "c_info": c_info_loss_val,
                         "Augment": ada_aug_p,
@@ -402,7 +493,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                 torch.save(
                     {
                         "g": g_module.state_dict(),
-                        # "d0": d_module0.state_dict(),
+                        "d0": d_module0.state_dict(),
                         "d1": d_module1.state_dict(),
                         "d2": d_module2.state_dict(),
                         "g_ema": g_ema.state_dict(),
@@ -436,7 +527,7 @@ if __name__ == "__main__":
         help="number of the samples generated during training",
     )
     parser.add_argument(
-        "--size", type=int, default=256, help="image sizes for the model"
+        "--size", type=int, default=128, help="image sizes for the model"
     )
     parser.add_argument(
         "--r1", type=float, default=10, help="weight of the r1 regularization"
@@ -568,16 +659,17 @@ if __name__ == "__main__":
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
-    # netD0 = Discriminator(
-    #     args.size, args.b_categories, channel_multiplier=args.channel_multiplier
-    # ).to(device)
+    depth = int(math.log(args.size, 2))-5
+    netD0 = D_NET_BG(depth).to(device)
+    netD0.apply(weights_init)
+
     netD1 = Discriminator(
         args.p_size, args.p_categories, channel_multiplier=args.channel_multiplier
     ).to(device)
     netD2 = Discriminator(
         args.size, args.c_categories, channel_multiplier=args.channel_multiplier
     ).to(device)
-    netsD = [None, netD1, netD2]
+    netsD = [netD0, netD1, netD2]
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -587,18 +679,19 @@ if __name__ == "__main__":
         lr=args.lr * g_reg_ratio,
         betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
-    # d_optim0 = optim.Adam(
-    #     netD0.parameters(),
-    #     lr=args.lr * d_reg_ratio,
-    #     betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
-    # )
+
+    d_optim0 = optim.Adam(
+        netsD[0].parameters(),
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
+    )
 
     d_optim2 = optim.Adam(
         netsD[2].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
-    rf_opt = [None, None, d_optim2]
+    rf_opt = [d_optim0, None, d_optim2]
 
     info_optim1 = optim.Adam(
         netsD[1].parameters(),
@@ -624,13 +717,13 @@ if __name__ == "__main__":
             pass
 
         generator.load_state_dict(ckpt["g"])
-        # netsD[0].load_state_dict(ckpt["d0"])
+        netsD[0].load_state_dict(ckpt["d0"])
         netsD[1].load_state_dict(ckpt["d1"])
         netsD[2].load_state_dict(ckpt["d2"])
         g_ema.load_state_dict(ckpt["g_ema"])
 
         g_optim.load_state_dict(ckpt["g_optim"])
-        # optD[0].load_state_dict(ckpt["d_optim0"])
+        rf_opt[0].load_state_dict(ckpt["d_optim0"])
         rf_opt[2].load_state_dict(ckpt["rf_optim"])
 
         info_opt[1].load_state_dict(ckpt["info_optim1"])
@@ -644,12 +737,12 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-        # netsD[0] = nn.parallel.DistributedDataParallel(
-        #     netsD[0],
-        #     device_ids=[args.local_rank],
-        #     output_device=args.local_rank,
-        #     broadcast_buffers=False,
-        # )
+        netsD[0] = nn.parallel.DistributedDataParallel(
+            netsD[0],
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
         netsD[1] = nn.parallel.DistributedDataParallel(
             netsD[1],
             device_ids=[args.local_rank],
@@ -665,7 +758,7 @@ if __name__ == "__main__":
 
     transform = transforms.Compose(
         [
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
         ]
@@ -681,6 +774,6 @@ if __name__ == "__main__":
 
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2")
+        wandb.init(project="stylegan2 bg patchgan")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
