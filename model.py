@@ -549,8 +549,8 @@ class Generator(nn.Module):
 
         self.p_depth = int(math.log(p_size, 2)) - 2
 
-        self.bg_generator = Stage_Generator(size, style_dim, code1_len=self.b_categories,
-            channel_multiplier=channel_multiplier, blur_kernel=blur_kernel)
+        # self.bg_generator = Stage_Generator(size, style_dim, code1_len=self.b_categories,
+        #     channel_multiplier=channel_multiplier, blur_kernel=blur_kernel)
         self.fg_generator = Stage_Generator(size, style_dim, code0_len=p_categories,
             code1_len=c_categories, stage0_depth=self.p_depth, channel_multiplier=channel_multiplier,
             blur_kernel=blur_kernel)
@@ -619,14 +619,14 @@ class Generator(nn.Module):
             p_code = self.child_to_parent(c_code)
             b_code = c_code
 
-        bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
+        # bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
 
         fg_skip_li = self.fg_generator(latent, p_code, c_code, noise=noise, randomize_noise=randomize_noise)
 
-        b_skip = bg_skip_li[-1]
+        # b_skip = bg_skip_li[-1]
         p_skip = fg_skip_li[self.p_depth]
         c_skip = fg_skip_li[-1]
-        b_image = b_skip[:, 0:3, :, :]
+        # b_image = b_skip[:, 0:3, :, :]
         p_image = p_skip[:, 0:3, :, :]
         p_mask = p_skip[:, 3:4, :, :]
         p_mask = torch.sigmoid(p_mask)
@@ -634,13 +634,16 @@ class Generator(nn.Module):
         c_mask = c_skip[:, 3:4, :, :]
         c_mask = torch.sigmoid(c_mask)
 
-        b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
+        # b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
         p_mkd = p_mask * p_image
         c_mkd = c_mask * c_image
-        fnl_image = b_mkd + c_mkd
+        # fnl_image = b_mkd + c_mkd
+        fnl_image = c_image
 
-        raw_images = [b_image, p_image, c_image]
-        mkd_images = [b_mkd, p_mkd, c_mkd]
+        # raw_images = [b_image, p_image, c_image]
+        # mkd_images = [b_mkd, p_mkd, c_mkd]
+        raw_images = [p_image, p_image, c_image]
+        mkd_images = [p_mkd, p_mkd, c_mkd]
         masks = [p_mask, c_mask]
 
         if return_latents:

@@ -169,6 +169,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
     criterion_class = nn.CrossEntropyLoss()
+
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -273,6 +274,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
         generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        # generator_loss = g_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
@@ -560,6 +562,7 @@ if __name__ == "__main__":
         args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
         args.p_size, channel_multiplier=args.channel_multiplier
     ).to(device)
+    print(generator)
 
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
@@ -631,7 +634,7 @@ if __name__ == "__main__":
 
         g_optim.load_state_dict(ckpt["g_optim"])
         # optD[0].load_state_dict(ckpt["d_optim0"])
-        rf_opt[2].load_state_dict(ckpt["rf_optim"])
+        rf_opt[2].load_state_dict(ckpt["rf_optim2"])
 
         info_opt[1].load_state_dict(ckpt["info_optim1"])
         info_opt[2].load_state_dict(ckpt["info_optim2"])
