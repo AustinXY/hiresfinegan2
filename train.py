@@ -13,6 +13,8 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
+
 # try:
 import wandb
 
