@@ -9,7 +9,7 @@
 import numpy as np
 import torch
 from torch_utils import misc
-from torch_utils import persistence
+# from torch_utils import persistence
 from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
