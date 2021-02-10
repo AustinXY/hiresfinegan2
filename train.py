@@ -3,6 +3,7 @@ import math
 import random
 import os
 import copy
+import dnnlib
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 # try:
 import wandb
@@ -152,6 +153,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         d_module = discriminator
 
     G_mapping = generator.mapping
+    G_synthesis = generator.synthesis
 
     accum = 0.5 ** (32 / (10 * 1000))
     ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
@@ -160,8 +162,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    sample_z = torch.randn(args.n_sample, args.latent, device=device)
-    c = torch.empty(args.n_sample, 0, device=device)
+    # sample_z = torch.randn(args.n_sample, args.latent, device=device)
+    c = torch.empty(args.batch, 0, device=device)
+
+    grid_z = torch.randn([args.n_sample, args.latent], device=device).split(8)
+    grid_c = torch.empty([args.n_sample, args.latent], device=device).split(8)
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -174,11 +179,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         real_img = next(loader)
         real_img = real_img.to(device)
 
-        requires_grad(generator, False)
-        requires_grad(discriminator, True)
+        g_module.requires_grad_(False)
+        d_module.requires_grad_(True)
 
         ws = mixing_noise(args.batch, args.latent, c, G_mapping, device)
-        fake_img = generator(ws)
+        fake_img = G_synthesis(ws)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -215,28 +220,28 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 real_img_aug = real_img_tmp
 
             real_pred = discriminator(real_img_aug, c)
-            r1_penalty = d_r1_loss(real_pred, real_img)
+            r1_penalty = d_r1_loss(real_pred, real_img_aug)
             r1_loss = r1_penalty.mean() * (args.r1_gamma / 2)
 
             discriminator.zero_grad()
-            (r1_loss * args.d_reg_every + 0 * real_pred).backward()
+            (r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
 
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
 
 
-        requires_grad(generator, True)
-        requires_grad(discriminator, False)
+        g_module.requires_grad_(True)
+        d_module.requires_grad_(False)
 
         ws = mixing_noise(args.batch, args.latent, c, G_mapping, device)
 
-        fake_img = generator(ws)
+        fake_img = G_synthesis(ws)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
+        fake_pred = discriminator(fake_img, c)
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
@@ -250,7 +255,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             ws = mixing_noise(path_batch_size, args.latent, c, G_mapping, device)
-            fake_img = generator(ws)
+            fake_img = G_synthesis(ws)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, ws, mean_path_length
@@ -274,6 +279,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         loss_dict["path_length"] = path_lengths.mean()
 
         # Update G_ema.
+        requires_grad(generator, False)
+
         # accumulate(g_ema, g_module, accum)
         ema_nimg = args.ema_kimg * 1000
         if args.ema_rampup is not None:
@@ -323,8 +330,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             if i % 100 == 0:
                 with torch.no_grad():
-                    g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    sample = torch.cat([g_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)])
                     utils.save_image(
                         sample,
                         f"sample/{str(i).zfill(6)}.png",
@@ -333,19 +339,19 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         range=(-1, 1),
                     )
 
-            if i % 10000 == 0:
-                torch.save(
-                    {
-                        "g": g_module.state_dict(),
-                        "d": d_module.state_dict(),
-                        "g_ema": g_ema.state_dict(),
-                        "g_optim": g_optim.state_dict(),
-                        "d_optim": d_optim.state_dict(),
-                        "args": args,
-                        "ada_aug_p": ada_aug_p,
-                    },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
-                )
+            # if i % 10000 == 0:
+            #     torch.save(
+            #         {
+            #             "g": g_module.state_dict(),
+            #             "d": d_module.state_dict(),
+            #             "g_ema": g_ema.state_dict(),
+            #             "g_optim": g_optim.state_dict(),
+            #             "d_optim": d_optim.state_dict(),
+            #             "args": args,
+            #             "ada_aug_p": ada_aug_p,
+            #         },
+            #         f"checkpoint/{str(i).zfill(6)}.pt",
+            #     )
 
 
 if __name__ == "__main__":
@@ -358,7 +364,7 @@ if __name__ == "__main__":
         "--iter", type=int, default=800000, help="total training iterations"
     )
     parser.add_argument(
-        "--batch", type=int, default=16, help="batch sizes for each gpus"
+        "--batch", type=int, default=0, help="batch sizes for each gpus"
     )
     parser.add_argument(
         "--n_sample",
@@ -467,10 +473,10 @@ if __name__ == "__main__":
 
     cfg = 'auto'
     gpus = 1
-    spec = cfg_specs[cfg]
+    spec = dnnlib.EasyDict(cfg_specs[cfg])
     if cfg == 'auto':
         spec.ref_gpus = gpus
-        res = args.training_set_kwargs.resolution
+        res = args.size
         spec.mb = max(min(gpus * min(4096 // res, 32), 64), gpus) # keep gpu memory consumption at bay
         spec.mbstd = min(spec.mb // gpus, 4) # other hyperparams behave more predictably if mbstd group size remains fixed
         spec.fmaps = 1 if res >= 512 else 0.5
@@ -481,10 +487,14 @@ if __name__ == "__main__":
     args.latent = 512
     args.n_mlp = 8
     args.r1_gamma = spec.gamma
-    args.args.ema_kimg = 2.5
+    args.ema_kimg = 2.5
     args.ema_rampup = 0.05
 
     args.start_iter = 0
+
+    if args.batch == 0:
+        args.batch = spec.mb
+    print('batch size: ', args.batch)
 
     generator = Generator(
         z_dim               = 512,                      # Input latent (Z) dimensionality.
@@ -497,7 +507,7 @@ if __name__ == "__main__":
                                 'channel_max': 512,
                                 'num_fp16_res': 4,
                                 'conv_clamp': 256},   # Arguments for SynthesisNetwork.
-    ).to(device)
+    ).train().requires_grad_(False).to(device)
     discriminator = Discriminator(
         c_dim               = 0,                          # Conditioning label (C) dimensionality.
         img_resolution      = args.size,                 # Input resolution.
@@ -511,10 +521,10 @@ if __name__ == "__main__":
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},       # Arguments for DiscriminatorEpilogue.
-    ).to(device)
+    ).train().requires_grad_(False).to(device)
     g_ema = copy.deepcopy(generator)
     g_ema.eval()
-    accumulate(g_ema, generator, 0)
+    # accumulate(g_ema, generator, 0)
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
