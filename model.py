@@ -8,6 +8,8 @@
 
 import numpy as np
 import torch
+from torch import nn
+from torch.nn import functional as F
 from torch_utils import misc
 # from torch_utils import persistence
 from torch_utils.ops import conv2d_resample
@@ -457,37 +459,112 @@ class SynthesisNetwork(torch.nn.Module):
                 w_idx += block.num_conv
 
         x = img = None
+        skip_li = []
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
             x, img = block(x, img, cur_ws, **block_kwargs)
-        return img
+            skip_li.append(img)
+        return skip_li
 
 #----------------------------------------------------------------------------
 
 class Generator(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality.
+        b_dim,
+        p_dim,
         c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
         img_resolution,             # Output resolution.
         img_channels,               # Number of output color channels.
+        p_res               = None, # p stage resolution
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
+        mix_prob = 0.9
     ):
         super().__init__()
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
+        self.mix_prob = mix_prob
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
-        self.num_ws = self.synthesis.num_ws
-        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.synthesis_bg = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.synthesis_fg = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.num_ws = self.synthesis_bg.num_ws
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        img = self.synthesis(ws, **synthesis_kwargs)
-        return img
+        if p_res is None:
+            p_res = img_resolution // 4
+        num_c_ws = img_resolution // p_res
+        num_p_ws = self.num_ws - num_c_ws
+
+        self.mapping_b = MappingNetwork(z_dim=z_dim, c_dim=b_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.mapping_p = MappingNetwork(z_dim=z_dim, c_dim=p_dim, w_dim=w_dim, num_ws=num_p_ws, **mapping_kwargs)
+        self.mapping_c = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=num_c_ws, **mapping_kwargs)
+
+    def style_mixing(self, z, b, p, c):
+        ws_b = self.mapping_b(z, b)
+        cutoff = torch.empty([], dtype=torch.int64, device=ws_b.device).random_(1, ws_b.shape[1])
+        cutoff = torch.where(torch.rand([], device=ws_b.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_b.shape[1]))
+        ws_b[:, cutoff:] = self.mapping_b(torch.randn_like(z), b, skip_w_avg_update=True)[:, cutoff:]
+
+        ws_p = self.mapping_p(z, p)
+        cutoff = torch.empty([], dtype=torch.int64, device=ws_p.device).random_(1, ws_p.shape[1])
+        cutoff = torch.where(torch.rand([], device=ws_p.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_p.shape[1]))
+        ws_p[:, cutoff:] = self.mapping_p(torch.randn_like(z), p, skip_w_avg_update=True)[:, cutoff:]
+
+        ws_c = self.mapping_c(z, c)
+        cutoff = torch.empty([], dtype=torch.int64, device=ws_c.device).random_(1, ws_c.shape[1])
+        cutoff = torch.where(torch.rand([], device=ws_c.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_c.shape[1]))
+        ws_c[:, cutoff:] = self.mapping_c(torch.randn_like(z), c, skip_w_avg_update=True)[:, cutoff:]
+
+        ws_fg = torch.cat((ws_p, ws_c), dim=1)
+        return [ws_b, ws_fg]
+
+    def generate(self, ws, **synthesis_kwargs):
+        ws_bg, ws_fg = ws
+        bg_skip_li = self.synthesis_bg(ws_bg, **synthesis_kwargs)
+        fg_skip_li = self.synthesis_fg(ws_fg, **synthesis_kwargs)
+
+        b_skip = bg_skip_li[-1]
+        p_skip = fg_skip_li[-3]
+        c_skip = fg_skip_li[-1]
+
+        b_image = b_skip[:, 0:3, :, :]
+        p_image = p_skip[:, 0:3, :, :]
+        p_mask = p_skip[:, 3:4, :, :]
+        p_mask = torch.sigmoid(p_mask)
+        c_image = c_skip[:, 0:3, :, :]
+        c_mask = c_skip[:, 3:4, :, :]
+        c_mask = torch.sigmoid(c_mask)
+
+        b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
+        p_mkd = p_mask * p_image
+        c_mkd = c_mask * c_image
+        fnl_image = b_mkd + c_mkd
+
+        raw_images = [b_image, p_image, c_image]
+        mkd_images = [b_mkd, p_mkd, c_mkd]
+        masks = [p_mask, c_mask]
+        return [fnl_image, raw_images, mkd_images, masks]
+
+    # def mix_n_generate(self, z, b, p, c):
+    #     ws = self.style_mixing(z, b, p, c)
+    #     img_li = self.generate(ws)
+    #     return img_li
+
+    def forward(self, z, b, p, c, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        if mix_style:
+            ws = self.style_mixing(z, b, p, c)
+        else:
+            ws_b = self.mapping_b(z, b, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+            ws_p = self.mapping_p(z, p, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+            ws_c = self.mapping_c(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+            ws_fg = torch.cat((ws_p, ws_c), dim=1)
+            ws = [ws_b, ws_fg]
+
+        image_li = self.generate(ws=ws, **synthesis_kwargs)
+        return image_li
 
 #----------------------------------------------------------------------------
 
@@ -605,11 +682,13 @@ class DiscriminatorEpilogue(torch.nn.Module):
         cmap_dim,                       # Dimensionality of mapped conditioning label, 0 = no label.
         resolution,                     # Resolution of this block.
         img_channels,                   # Number of input color channels.
+        c_dim,
         architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
         mbstd_group_size    = 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
         mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
         activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
         conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        predict_c           = True,
     ):
         assert architecture in ['orig', 'skip', 'resnet']
         super().__init__()
@@ -618,6 +697,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.resolution = resolution
         self.img_channels = img_channels
         self.architecture = architecture
+        self.predict_c = predict_c
 
         if architecture == 'skip':
             self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
@@ -625,6 +705,8 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
         self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
         self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
+        if predict_c:
+            self.pred_linear = FullyConnectedLayer(in_channels, c_dim)
 
     def forward(self, x, img, cmap, force_fp32=False):
         misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution]) # [NCHW]
@@ -644,7 +726,10 @@ class DiscriminatorEpilogue(torch.nn.Module):
             x = self.mbstd(x)
         x = self.conv(x)
         x = self.fc(x.flatten(1))
-        x = self.out(x)
+        _x = self.out(x)
+        if self.predict_c:
+            _c = self.pred_linear(x)
+            return [_x, _c]
 
         # Conditioning.
         if self.cmap_dim > 0:
@@ -670,6 +755,7 @@ class Discriminator(torch.nn.Module):
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+        predict_c           = True,     # If predict c, then info discriminator, else conditional discriminator.
     ):
         super().__init__()
         self.c_dim = c_dim
@@ -677,12 +763,13 @@ class Discriminator(torch.nn.Module):
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        self.predict_c = predict_c
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
         if cmap_dim is None:
             cmap_dim = channels_dict[4]
-        if c_dim == 0:
+        if predict_c or c_dim == 0:
             cmap_dim = 0
 
         common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
@@ -696,20 +783,126 @@ class Discriminator(torch.nn.Module):
                 first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
             setattr(self, f'b{res}', block)
             cur_layer_idx += block.num_layers
-        if c_dim > 0:
+        if not predict_c and c_dim > 0:
             self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
-        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
+        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, c_dim=c_dim, **epilogue_kwargs, **common_kwargs)
 
-    def forward(self, img, c, **block_kwargs):
+    def forward(self, img, c=None, **block_kwargs):
         x = None
         for res in self.block_resolutions:
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
 
         cmap = None
-        if self.c_dim > 0:
+        if not self.predict_c and self.c_dim > 0:
             cmap = self.mapping(None, c)
         x = self.b4(x, img, cmap)
         return x
 
 #----------------------------------------------------------------------------
+class MnetConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=False):
+        super().__init__()
+        self.input_conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+        self.mask_conv = nn.Conv2d(
+            1, 1, kernel_size, stride, padding, dilation, groups, False)
+
+        # mask is not updated
+        for param in self.mask_conv.parameters():
+            param.requires_grad = False
+
+    def forward(self, input, mask):
+        """
+        input is regular tensor with shape N*C*H*W
+        mask has to have 1 channel N*1*H*W
+        """
+        output = self.input_conv(input)
+        if mask is not None:
+            mask = self.mask_conv(mask)
+        return output, mask
+
+
+class downBlock_mnet(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, dilation=1, groups=1, bias=False):
+        super().__init__()
+        self.conv = MnetConv(in_channels, out_channels,
+                             kernel_size, stride, padding, dilation, groups, bias)
+        # self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, input, mask=None):
+        """
+        input is regular tensor with shape N*C*H*W
+        mask has to have 1 channel N*1*H*W
+        """
+        output, mask = self.conv(input, mask)
+        # output = self.bn(output)
+        output = F.leaky_relu(output, 0.2, inplace=True)
+        output = F.avg_pool2d(output, 2)
+        if mask is not None:
+            mask = F.avg_pool2d(mask, 2)
+        return output, mask
+
+
+def fromRGB_layer(out_planes):
+    layer = nn.Sequential(
+        nn.Conv2d(3, out_planes, 1, 1, 0, bias=False),
+        nn.LeakyReLU(0.2, inplace=True)
+    )
+    return layer
+
+
+class D_NET_BG_BASE(nn.Module):
+    def __init__(self, ndf):
+        super().__init__()
+        self.df_dim = ndf
+        self.define_module()
+
+    def define_module(self):
+        ndf = self.df_dim
+        self.conv = MnetConv(ndf, ndf * 2, 3, 1, 1)
+        self.conv_uncond_logits1 = MnetConv(ndf * 2, 1, 3, 1, 1)
+        self.conv_uncond_logits2 = MnetConv(ndf * 2, 1, 3, 1, 1)
+
+    def forward(self, x_code, mask):
+        x_code, mask = self.conv(x_code, mask)
+        x_code = F.leaky_relu(x_code, 0.2, inplace=True)
+        _x_code, _mask = self.conv_uncond_logits1(x_code, mask)
+        classi_score = torch.sigmoid(_x_code)
+        _x_code, _mask = self.conv_uncond_logits2(x_code, mask)
+        rf_score = torch.sigmoid(_x_code)
+        return [classi_score, rf_score], _mask
+
+
+class D_NET_BG(nn.Module):
+    def __init__(self, start_depth):
+        super().__init__()
+        self.df_dim = 256
+        self.start_depth = start_depth
+        self.define_module()
+
+    def define_module(self):
+        ndf = self.df_dim
+        self.from_RGB_net = nn.ModuleList([fromRGB_layer(ndf)])
+        self.down_net = nn.ModuleList([D_NET_BG_BASE(ndf)])
+        ndf = ndf // 2
+        for _ in range(self.start_depth):
+            self.from_RGB_net.append(fromRGB_layer(ndf))
+            self.down_net.append(downBlock_mnet(ndf, ndf * 2, 3, 1, 1))
+            ndf = ndf // 2
+
+        self.df_dim = ndf
+        self.cur_depth = self.start_depth
+
+    def forward(self, x_var, alpha=None, mask=None):
+        x_code = self.from_RGB_net[self.cur_depth](x_var)
+        for i in range(self.cur_depth, -1, -1):
+            x_code, mask = self.down_net[i](x_code, mask)
+            if i == self.cur_depth and i != self.start_depth and alpha < 1:
+                y_var = F.avg_pool2d(x_var, 2)
+                y_code = self.from_RGB_net[i-1](y_var)
+                x_code = (1 - alpha) * y_code + alpha * x_code
+
+        classi_score = x_code[0]
+        rf_score = x_code[1]
+        return [rf_score, classi_score, mask]

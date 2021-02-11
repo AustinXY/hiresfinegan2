@@ -3,7 +3,11 @@ from io import BytesIO
 import lmdb
 from PIL import Image
 from torch.utils.data import Dataset
-
+from torchvision import transforms, utils
+import pickle
+import random
+import torch
+import numpy as np
 
 class MultiResolutionDataset(Dataset):
     def __init__(self, path, transform, resolution=256):
@@ -31,10 +35,18 @@ class MultiResolutionDataset(Dataset):
     def __getitem__(self, index):
         with self.env.begin(write=False) as txn:
             key = f'{self.resolution}-{str(index).zfill(5)}'.encode('utf-8')
-            img_bytes = txn.get(key)
+            value = txn.get(key)
 
-        buffer = BytesIO(img_bytes)
+        im_pair = pickle.loads(value)
+        buffer = im_pair.get_image_buffer()
         img = Image.open(buffer)
-        img = self.transform(img)
+        mask = im_pair.mask
 
-        return img
+        img = self.transform(img)
+        mask = transforms.ToTensor()(np.array(mask))
+
+        if torch.rand(1) > 0.5:
+            img = transforms.functional.hflip(img)
+            mask = transforms.functional.hflip(mask)
+
+        return img, mask
