@@ -82,8 +82,12 @@ def prepare(
     files = [(i, file) for i, (file, _) in enumerate(files)]
     total = 0
 
+    idx = 0
     with multiprocessing.Pool(n_worker) as pool:
         for i, imims in tqdm(pool.imap_unordered(resize_fn, files)):
+            idx += 1
+            if idx >= 1000:
+                break
             for size, imim in zip(sizes, imims):
                 key = f"{size}-{str(i).zfill(5)}".encode("utf-8")
                 value = IMIM(imim[0], imim[1])

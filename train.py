@@ -721,6 +721,7 @@ if __name__ == "__main__":
         spec.ema = spec.mb * 10 / 32
 
     args.latent = 512
+    args.w_dim = 512
     args.n_mlp = 8
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
@@ -741,11 +742,11 @@ if __name__ == "__main__":
     print('batch size: ', args.batch)
 
     generator = Generator(
-        z_dim               = 512,                      # Input latent (Z) dimensionality.
+        z_dim               = args.latent,              # Input latent (Z) dimensionality.
         b_dim               = args.b_dim,               # Conditioning label (C) dimensionality.
         p_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
         c_dim               = args.c_dim,               # Conditioning label (C) dimensionality.
-        w_dim               = 512,                      # Intermediate latent (W) dimensionality.
+        w_dim               = args.w_dim,               # Intermediate latent (W) dimensionality.
         img_resolution      = args.size,                # Output resolution.
         img_channels        = 4,                        # Number of output color channels.
         p_res               = args.p_res,               # p stage resolution
@@ -799,36 +800,31 @@ if __name__ == "__main__":
 
     g_optim = optim.Adam(
         generator.parameters(),
-        lr=args.lr,
-        betas=(0, 0.99),
-        eps=1e-8,
+        lr=args.lr * g_reg_ratio,
+        betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
 
     d_optim0 = optim.Adam(
         netsD[0].parameters(),
-        lr=args.lr,
-        betas=(0, 0.99),
-        eps=1e-8,
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     d_optim2 = optim.Adam(
         netsD[2].parameters(),
-        lr=args.lr,
-        betas=(0, 0.99),
-        eps=1e-8,
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     rf_opt = [d_optim0, None, d_optim2]
 
     info_optim1 = optim.Adam(
         netsD[1].parameters(),
-        lr=args.lr,
-        betas=(0, 0.99),
-        eps=1e-8,
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     info_optim2 = optim.Adam(
         netsD[2].parameters(),
-        lr=args.lr,
-        betas=(0, 0.99),
-        eps=1e-8,
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     info_opt = [None, info_optim1, info_optim2]
 
