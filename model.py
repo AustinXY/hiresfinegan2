@@ -541,17 +541,14 @@ class Generator(torch.nn.Module):
         b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
         p_mkd = p_mask * p_image
         c_mkd = c_mask * c_image
-        fnl_image = b_mkd + c_mkd
+        # fnl_image = b_mkd + c_mkd
+        fnl_image = c_image
 
         raw_images = [b_image, p_image, c_image]
-        mkd_images = [b_mkd, p_mkd, c_mkd]
+        # mkd_images = [b_mkd, p_mkd, c_mkd]
+        mkd_images = raw_images
         masks = [p_mask, c_mask]
         return [fnl_image, raw_images, mkd_images, masks]
-
-    # def mix_n_generate(self, z, b, p, c):
-    #     ws = self.style_mixing(z, b, p, c)
-    #     img_li = self.generate(ws)
-    #     return img_li
 
     def forward(self, z, b, p, c, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         if mix_style:

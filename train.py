@@ -107,13 +107,14 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
-    grad_bg, = autograd.grad(
-        outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
-    )
+    # grad_bg, = autograd.grad(
+    #     outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
+    # )
     grad_fg, = autograd.grad(
         outputs=(fake_img * noise).sum(), inputs=latents[1], create_graph=True
     )
-    grad = grad_bg + grad_fg
+    grad = grad_fg
+    # grad = grad_bg + grad_fg
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
@@ -387,15 +388,18 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
-        binary_loss = binarization_loss(masks[1]) * 1e1
+        # binary_loss = binarization_loss(masks[1]) * 0
+        binary_loss = torch.zeros(1).to(device)
         # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         ms = masks[1].size()
         min_fg_cvg = 0.2 * ms[2] * ms[3]
-        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 1e-2
+        # fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 0
+        fg_cvg_loss = torch.zeros(1).to(device)
 
         ms = masks[1].size()
         min_bg_cvg = 0.2 * ms[2] * ms[3]
-        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 1e-2
+        # bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 0
+        bg_cvg_loss = torch.zeros(1).to(device)
 
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
