@@ -292,7 +292,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         ############# train child discriminator #############
         generator.requires_grad_(False)
         netsD[0].requires_grad_(False)
-        netsD[1].requires_grad_(False)
+        # netsD[1].requires_grad_(False)
         netsD[2].requires_grad_(True)
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
@@ -349,8 +349,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         #----------------------------------------------------------------------------
         requires_grad(generator, True)
         requires_grad(netsD[0], False)
-        requires_grad(netsD[1], True)
-        requires_grad(netsD[2], True)
+        # requires_grad(netsD[1], False)
+        requires_grad(netsD[2], False)
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
         image_li = generator(z, b, p, c, mix_style=True)
@@ -378,13 +378,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         loss_dict["g"] = g_loss
 
-        # parent, child info
-        pred_p = netsD[1](mkd_images[1])[1]
-        p_info_loss = criterion_class(pred_p, torch.nonzero(p.long(), as_tuple=False)[:,1])
+        # # parent, child info
+        # pred_p = netsD[1](mkd_images[1])[1]
+        # p_info_loss = criterion_class(pred_p, torch.nonzero(p.long(), as_tuple=False)[:,1])
 
-        pred_c = netsD[2](mkd_images[2])[1]
-        c_info_loss = criterion_class(pred_c, torch.nonzero(c.long(), as_tuple=False)[:,1])
-
+        # pred_c = netsD[2](mkd_images[2])[1]
+        # c_info_loss = criterion_class(pred_c, torch.nonzero(c.long(), as_tuple=False)[:,1])
+        p_info_loss = torch.zeros(1).to(device)
+        c_info_loss = torch.zeros(1).to(device)
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
@@ -404,7 +405,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss# + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         # netsD[0].zero_grad()
@@ -412,8 +413,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         netsD[2].zero_grad()
         generator_loss.backward()
         g_optim.step()
-        info_opt[1].step()
-        info_opt[2].step()
+        # info_opt[1].step()
+        # info_opt[2].step()
 
         g_regularize = i % args.g_reg_every == 0
 
@@ -506,7 +507,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     }
                 )
 
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 with torch.no_grad():
                     g_ema.eval()
                     image_li_li = [
@@ -575,7 +576,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             range=(0, 1),
                         )
 
-            if i % 5000 == 0:
+            if i % 10000 == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -747,9 +748,9 @@ if __name__ == "__main__":
 
     generator = Generator(
         z_dim               = args.latent,              # Input latent (Z) dimensionality.
-        b_dim               = args.b_dim,               # Conditioning label (C) dimensionality.
-        p_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
-        c_dim               = args.c_dim,               # Conditioning label (C) dimensionality.
+        b_dim = 0,#               = args.b_dim,               # Conditioning label (C) dimensionality.
+        p_dim = 0,#                = args.p_dim,               # Conditioning label (C) dimensionality.
+        c_dim = 0,#          = args.c_dim,               # Conditioning label (C) dimensionality.
         w_dim               = args.w_dim,               # Intermediate latent (W) dimensionality.
         img_resolution      = args.size,                # Output resolution.
         img_channels        = 4,                        # Number of output color channels.
@@ -760,6 +761,9 @@ if __name__ == "__main__":
                                'num_fp16_res': 4,
                                'conv_clamp': 256},      # Arguments for SynthesisNetwork.
     ).train().requires_grad_(False).to(device)
+
+    print(generator)
+    sys.exit(0)
     g_ema = copy.deepcopy(generator)
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
@@ -769,8 +773,8 @@ if __name__ == "__main__":
     netD0.apply(weights_init)
 
     netD1 = Discriminator(
-        c_dim               = args.p_dim,                        # Conditioning label (C) dimensionality.
-        img_resolution      = args.p_res,                # Input resolution.
+        c_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
+        img_resolution      = args.p_res,               # Input resolution.
         img_channels        = 3,                        # Number of input color channels.
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,                    # Overall multiplier for the number of channels.
@@ -784,7 +788,7 @@ if __name__ == "__main__":
     ).train().requires_grad_(False).to(device)
 
     netD2 = Discriminator(
-        c_dim               = args.c_dim,                        # Conditioning label (C) dimensionality.
+        c_dim               = args.c_dim,               # Conditioning label (C) dimensionality.
         img_resolution      = args.size,                # Input resolution.
         img_channels        = 3,                        # Number of input color channels.
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
