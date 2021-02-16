@@ -479,6 +479,10 @@ class Stage_Generator(nn.Module):
         if depth > self.stage0_depth:
             code = code1
 
+        # print(code.size())
+        # print(latent[:, 0].size())
+        # sys.exit()
+
         _latent0 = torch.cat([latent[:, 0], code], 1)
         _latent1 = torch.cat([latent[:, 1], code], 1)
 
@@ -585,6 +589,7 @@ class Generator(nn.Module):
         randomize_noise=True,
         ):
 
+
         if not input_is_latent:
             styles = [self.style(s) for s in styles]
 
@@ -616,8 +621,11 @@ class Generator(nn.Module):
             latent = torch.cat([latent, latent2], 1)
 
         if tied_code:
-            p_code = self.child_to_parent(c_code)
-            b_code = c_code
+            c_code = torch.empty(c_code.size(0), 0).to(c_code.device)
+            p_code = torch.empty(c_code.size(0), 0).to(c_code.device)
+            b_code = torch.empty(c_code.size(0), 0).to(c_code.device)
+            # p_code = self.child_to_parent(c_code)
+            # b_code = c_code
 
         bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
 
@@ -637,10 +645,12 @@ class Generator(nn.Module):
         b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
         p_mkd = p_mask * p_image
         c_mkd = c_mask * c_image
-        fnl_image = b_mkd + c_mkd
+        # fnl_image = b_mkd + c_mkd
+        fnl_image = c_image
 
         raw_images = [b_image, p_image, c_image]
-        mkd_images = [b_mkd, p_mkd, c_mkd]
+        # mkd_images = [b_mkd, p_mkd, c_mkd]
+        mkd_images = raw_images
         masks = [p_mask, c_mask]
 
         if return_latents:
