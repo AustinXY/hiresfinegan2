@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -292,7 +292,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         ############# train child discriminator #############
         generator.requires_grad_(False)
         netsD[0].requires_grad_(False)
-        # netsD[1].requires_grad_(False)
+        netsD[1].requires_grad_(False)
         netsD[2].requires_grad_(True)
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
@@ -302,7 +302,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
             fake_img, _ = augment(fake_img, ada_aug_p)
-
         else:
             real_img_aug = real_img
 
@@ -349,8 +348,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         #----------------------------------------------------------------------------
         requires_grad(generator, True)
         requires_grad(netsD[0], False)
-        # requires_grad(netsD[1], False)
-        requires_grad(netsD[2], False)
+        requires_grad(netsD[1], True)
+        requires_grad(netsD[2], True)
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
         image_li = generator(z, b, p, c, mix_style=True)
@@ -378,14 +377,13 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         loss_dict["g"] = g_loss
 
-        # # parent, child info
-        # pred_p = netsD[1](mkd_images[1])[1]
-        # p_info_loss = criterion_class(pred_p, torch.nonzero(p.long(), as_tuple=False)[:,1])
+        # parent, child info
+        pred_p = netsD[1](mkd_images[1])[1]
+        p_info_loss = criterion_class(pred_p, torch.nonzero(p.long(), as_tuple=False)[:,1])
 
-        # pred_c = netsD[2](mkd_images[2])[1]
-        # c_info_loss = criterion_class(pred_c, torch.nonzero(c.long(), as_tuple=False)[:,1])
-        p_info_loss = torch.zeros(1).to(device)
-        c_info_loss = torch.zeros(1).to(device)
+        pred_c = netsD[2](mkd_images[2])[1]
+        c_info_loss = criterion_class(pred_c, torch.nonzero(c.long(), as_tuple=False)[:,1])
+
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
@@ -405,16 +403,15 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + g_bg_loss# + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss # + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
-        # netsD[0].zero_grad()
         netsD[1].zero_grad()
         netsD[2].zero_grad()
         generator_loss.backward()
         g_optim.step()
-        # info_opt[1].step()
-        # info_opt[2].step()
+        info_opt[1].step()
+        info_opt[2].step()
 
         g_regularize = i % args.g_reg_every == 0
 
@@ -762,8 +759,6 @@ if __name__ == "__main__":
                                'conv_clamp': 256},      # Arguments for SynthesisNetwork.
     ).train().requires_grad_(False).to(device)
 
-    print(generator)
-    sys.exit(0)
     g_ema = copy.deepcopy(generator)
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
@@ -905,6 +900,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan")
+        wandb.init(project="stylegan 2 pgan io")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
