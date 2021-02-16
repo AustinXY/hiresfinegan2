@@ -12,7 +12,6 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 from prepare_data import IMIM
-from torchsummary import summary
 
 
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -142,7 +141,6 @@ def set_grad_none(model, targets):
 
 
 def sample_c_code(batch, c_categories, device):
-    return torch.empty(batch, 0).to(device)
     c_code = torch.zeros(batch, c_categories).to(device)
     cid = np.random.randint(c_categories, size=batch)
     for i in range(batch):
@@ -216,308 +214,311 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         c_code = sample_c_code(args.batch, args.c_categories, device)
 
-        # summary(generator, [[512], [200]])
-        # sys.exit()
-
         image_li, _, _ = generator(noise, c_code)
-        # raw_images = image_li[1]
-        # fake_bg = raw_images[0]
+        raw_images = image_li[1]
+        fake_bg = raw_images[0]
 
-        # real_logits = netsD[0](real_img, mask=mask)
+        real_logits = netsD[0](real_img, mask=mask)
 
-        # rf_scores, _, fnl_masks = real_logits
-        # weights_real = torch.ones_like(rf_scores)
+        rf_scores, _, fnl_masks = real_logits
+        weights_real = torch.ones_like(rf_scores)
 
-        # invalid_patch = fnl_masks != 0.0
-        # weights_real.masked_fill_(invalid_patch, 0.0)
+        invalid_patch = fnl_masks != 0.0
+        weights_real.masked_fill_(invalid_patch, 0.0)
 
-        # real_labels = torch.ones_like(rf_scores)
+        real_labels = torch.ones_like(rf_scores)
 
-        # errD_real_uncond = criterion(real_logits[0], real_labels)  # Real/Fake loss for 'real background' (on patch level)
-        # errD_real_uncond = torch.mul(errD_real_uncond, weights_real)  # Masking output units which correspond to receptive fields which lie within the boundin box
-        # errD_real_uncond = errD_real_uncond.mean()
+        errD_real_uncond = criterion(real_logits[0], real_labels)  # Real/Fake loss for 'real background' (on patch level)
+        errD_real_uncond = torch.mul(errD_real_uncond, weights_real)  # Masking output units which correspond to receptive fields which lie within the boundin box
+        errD_real_uncond = errD_real_uncond.mean()
 
-        # errD_real_uncond_classi = criterion(real_logits[1], weights_real)  # Background/foreground classification loss
-        # errD_real_uncond_classi = errD_real_uncond_classi.mean()
+        errD_real_uncond_classi = criterion(real_logits[1], weights_real)  # Background/foreground classification loss
+        errD_real_uncond_classi = errD_real_uncond_classi.mean()
 
-        # fake_logits = netsD[0](fake_bg, mask=None)
+        fake_logits = netsD[0](fake_bg, mask=None)
 
-        # fake_labels = torch.zeros_like(fake_logits[0])
+        fake_labels = torch.zeros_like(fake_logits[0])
 
-        # errD_fake_uncond = criterion(fake_logits[0], fake_labels)  # Real/Fake loss for 'fake background' (on patch level)
-        # errD_fake_uncond = errD_fake_uncond.mean()
+        errD_fake_uncond = criterion(fake_logits[0], fake_labels)  # Real/Fake loss for 'fake background' (on patch level)
+        errD_fake_uncond = errD_fake_uncond.mean()
 
-        # norm_fact_real = weights_real.sum()
-        # norm_fact_fake = weights_real.shape[0]*weights_real.shape[1]*weights_real.shape[2]*weights_real.shape[3]
+        norm_fact_real = weights_real.sum()
+        norm_fact_fake = weights_real.shape[0]*weights_real.shape[1]*weights_real.shape[2]*weights_real.shape[3]
 
-        # if norm_fact_real > 0:    # Normalizing the real/fake loss for background after accounting the number of masked members in the output.
-        #     errD_real = errD_real_uncond * ((norm_fact_fake * 1.0) /(norm_fact_real * 1.0))
-        # else:
-        #     errD_real = errD_real_uncond
+        if norm_fact_real > 0:    # Normalizing the real/fake loss for background after accounting the number of masked members in the output.
+            errD_real = errD_real_uncond * ((norm_fact_fake * 1.0) /(norm_fact_real * 1.0))
+        else:
+            errD_real = errD_real_uncond
 
-        # errD_fake = errD_fake_uncond
-        # errD = ((errD_real + errD_fake) * args.bg_wt) + errD_real_uncond_classi
+        errD_fake = errD_fake_uncond
+        errD = ((errD_real + errD_fake) * args.bg_wt) + errD_real_uncond_classi
 
-        # loss_dict["d0"] = errD
+        loss_dict["d0"] = errD
 
-        # netsD[0].zero_grad()
-        # errD.backward()
-        # rf_opt[0].step()
+        netsD[0].zero_grad()
+        errD.backward()
+        rf_opt[0].step()
+        del image_li, fake_bg, raw_images
+
+        ############# train child discriminator #############
+        requires_grad(generator, False)
+        requires_grad(netsD[0], False)
+        requires_grad(netsD[1], False)
+        requires_grad(netsD[2], True)
+
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        c_code = sample_c_code(args.batch, args.c_categories, device)
+        image_li, _, _ = generator(noise, c_code)
+        fake_img = image_li[0]
+
+        if args.augment:
+            real_img_aug, _ = augment(real_img, ada_aug_p)
+            fake_img, _ = augment(fake_img, ada_aug_p)
+        else:
+            real_img_aug = real_img
+
+        fake_pred = netsD[2](fake_img)[0]
+        real_pred = netsD[2](real_img_aug)[0]
+
+        d_loss = d_logistic_loss(real_pred, fake_pred)
+
+        loss_dict["d"] = d_loss
+        loss_dict["real_score"] = real_pred.mean()
+        loss_dict["fake_score"] = fake_pred.mean()
+
+        netsD[2].zero_grad()
+        d_loss.backward()
+        rf_opt[2].step()
+        del image_li, fake_img
+
+        if args.augment and args.augment_p == 0:
+            ada_aug_p = ada_augment.tune(real_pred)
+            r_t_stat = ada_augment.r_t_stat
+
+        d_regularize = i % args.d_reg_every == 0
+
+        if d_regularize:
+            real_img.requires_grad = True
+            real_pred = netsD[2](real_img)[0]
+            r1_loss = d_r1_loss(real_pred, real_img)
+
+            netsD[2].zero_grad()
+            (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
+
+            rf_opt[2].step()
+
+        loss_dict["r1"] = r1_loss
 
 
-        # ############# train child discriminator #############
-        # requires_grad(generator, False)
-        # requires_grad(netsD[0], False)
-        # requires_grad(netsD[1], False)
-        # requires_grad(netsD[2], True)
+        ############# train generator #############
+        requires_grad(generator, True)
+        requires_grad(netsD[0], False)
+        requires_grad(netsD[1], True)
+        requires_grad(netsD[2], True)
 
-        # noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        # c_code = sample_c_code(args.batch, args.c_categories, device)
-        # image_li, _, _ = generator(noise, c_code)
-        # fake_img = image_li[0]
-
-        # if args.augment:
-        #     real_img_aug, _ = augment(real_img, ada_aug_p)
-        #     fake_img, _ = augment(fake_img, ada_aug_p)
-        # else:
-        #     real_img_aug = real_img
-
-        # fake_pred = netsD[2](fake_img)[0]
-        # real_pred = netsD[2](real_img_aug)[0]
-
-        # d_loss = d_logistic_loss(real_pred, fake_pred)
-
-        # loss_dict["d"] = d_loss
-        # loss_dict["real_score"] = real_pred.mean()
-        # loss_dict["fake_score"] = fake_pred.mean()
-
-        # netsD[2].zero_grad()
-        # d_loss.backward()
-        # rf_opt[2].step()
-
-        # if args.augment and args.augment_p == 0:
-        #     ada_aug_p = ada_augment.tune(real_pred)
-        #     r_t_stat = ada_augment.r_t_stat
-
-        # d_regularize = i % args.d_reg_every == 0
-
-        # if d_regularize:
-        #     real_img.requires_grad = True
-        #     real_pred = netsD[2](real_img)[0]
-        #     r1_loss = d_r1_loss(real_pred, real_img)
-
-        #     netsD[2].zero_grad()
-        #     (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
-
-        #     rf_opt[2].step()
-
-        # loss_dict["r1"] = r1_loss
-
-
-        # ############# train generator #############
-        # requires_grad(generator, True)
-        # requires_grad(netsD[0], False)
-        # requires_grad(netsD[1], True)
-        # requires_grad(netsD[2], True)
-
-        # noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        # c_code = sample_c_code(args.batch, args.c_categories, device)
-        # image_li, code_li, _ = generator(noise, c_code)
-        # fake_img = image_li[0]
-        # mkd_images = image_li[2]
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        c_code = sample_c_code(args.batch, args.c_categories, device)
+        image_li, code_li, _ = generator(noise, c_code)
+        fake_img = image_li[0]
+        mkd_images = image_li[2]
         # masks = image_li[3]
-        # p_code = code_li[1]
-        # c_code = code_li[2]
+        p_code = code_li[1]
+        c_code = code_li[2]
 
-        # if args.augment:
-        #     fake_img, _ = augment(fake_img, ada_aug_p)
+        if args.augment:
+            fake_img, _ = augment(fake_img, ada_aug_p)
 
-        # # background rf
-        # output = netsD[0](fake_img)
-        # real_labels = torch.ones_like(output[0])
-        # g_bg_loss = criterion_one(output[0], real_labels) * args.bg_wt
-        # errG_classi = criterion_one(output[1], real_labels) # Background/Foreground classification loss for the fake background image (on patch level)
-        # g_bg_loss += errG_classi
+        # background rf
+        output = netsD[0](fake_img)
+        real_labels = torch.ones_like(output[0])
+        g_bg_loss = criterion_one(output[0], real_labels) * args.bg_wt
+        errG_classi = criterion_one(output[1], real_labels) # Background/Foreground classification loss for the fake background image (on patch level)
+        g_bg_loss += errG_classi
 
-        # loss_dict["g_bg"] = g_bg_loss
+        loss_dict["g_bg"] = g_bg_loss
 
-        # # child rf
-        # fake_pred = netsD[2](fake_img)[0]
-        # g_loss = g_nonsaturating_loss(fake_pred)
+        # child rf
+        fake_pred = netsD[2](fake_img)[0]
+        g_loss = g_nonsaturating_loss(fake_pred)
 
-        # loss_dict["g"] = g_loss
+        loss_dict["g"] = g_loss
 
-        # # parent, child info
-        # pred_p = netsD[1](mkd_images[1])[1]
-        # p_info_loss = criterion_class(pred_p, torch.nonzero(p_code.long(), as_tuple=False)[:,1])
+        # parent, child info
+        pred_p = netsD[1](mkd_images[1])[1]
+        p_info_loss = criterion_class(pred_p, torch.nonzero(p_code.long(), as_tuple=False)[:,1])
 
-        # pred_c = netsD[2](mkd_images[2])[1]
-        # c_info_loss = criterion_class(pred_c, torch.nonzero(c_code.long(), as_tuple=False)[:,1])
+        pred_c = netsD[2](mkd_images[2])[1]
+        c_info_loss = criterion_class(pred_c, torch.nonzero(c_code.long(), as_tuple=False)[:,1])
 
-        # loss_dict["p_info"] = p_info_loss
-        # loss_dict["c_info"] = c_info_loss
+        loss_dict["p_info"] = p_info_loss
+        loss_dict["c_info"] = c_info_loss
 
         # binary_loss = binarization_loss(masks[1]) * 0
-        # # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
+        binary_loss = torch.zeros(1).to(device)
+        # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         # ms = masks[1].size()
         # min_fg_cvg = 0.2 * ms[2] * ms[3]
         # fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 0
+        fg_cvg_loss = torch.zeros(1).to(device)
 
         # ms = masks[1].size()
         # min_bg_cvg = 0.2 * ms[2] * ms[3]
         # bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 0
+        bg_cvg_loss = torch.zeros(1).to(device)
 
-        # loss_dict["bin"] = binary_loss
-        # loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
+        loss_dict["bin"] = binary_loss
+        loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        # generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss #+ binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss #+ binary_loss + fg_cvg_loss + bg_cvg_loss
 
-        # generator.zero_grad()
-        # # netsD[0].zero_grad()
-        # netsD[1].zero_grad()
-        # netsD[2].zero_grad()
-        # generator_loss.backward()
-        # g_optim.step()
-        # info_opt[1].step()
-        # info_opt[2].step()
+        generator.zero_grad()
+        netsD[1].zero_grad()
+        netsD[2].zero_grad()
+        generator_loss.backward()
+        g_optim.step()
+        info_opt[1].step()
+        info_opt[2].step()
 
-        # g_regularize = i % args.g_reg_every == 0
+        del image_li, fake_img, mkd_images
 
-        # if g_regularize:
-        #     path_batch_size = max(1, args.batch // args.path_batch_shrink)
-        #     noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
-        #     c_code = sample_c_code(path_batch_size, args.c_categories, device)
-        #     image_li, _, latents = generator(noise, c_code, return_latents=True)
-        #     fake_img = image_li[0]
+        g_regularize = i % args.g_reg_every == 0
 
-        #     path_loss, mean_path_length, path_lengths = g_path_regularize(
-        #         fake_img, latents, mean_path_length
-        #     )
+        if g_regularize:
+            path_batch_size = max(1, args.batch // args.path_batch_shrink)
+            noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
+            c_code = sample_c_code(path_batch_size, args.c_categories, device)
+            image_li, _, latents = generator(noise, c_code, return_latents=True)
+            fake_img = image_li[0]
 
-        #     generator.zero_grad()
-        #     weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
+            path_loss, mean_path_length, path_lengths = g_path_regularize(
+                fake_img, latents, mean_path_length
+            )
 
-        #     if args.path_batch_shrink:
-        #         weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
+            generator.zero_grad()
+            weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
 
-        #     weighted_path_loss.backward()
+            if args.path_batch_shrink:
+                weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
 
-        #     g_optim.step()
+            weighted_path_loss.backward()
 
-        #     mean_path_length_avg = (
-        #         reduce_sum(mean_path_length).item() / get_world_size()
-        #     )
+            g_optim.step()
 
-        # loss_dict["path"] = path_loss
-        # loss_dict["path_length"] = path_lengths.mean()
+            mean_path_length_avg = (
+                reduce_sum(mean_path_length).item() / get_world_size()
+            )
 
-        # accumulate(g_ema, g_module, accum)
 
-        # loss_reduced = reduce_loss_dict(loss_dict)
+        loss_dict["path"] = path_loss
+        loss_dict["path_length"] = path_lengths.mean()
 
-        # d_loss_val = loss_reduced["d"].mean().item()
-        # d0_loss_val = loss_reduced["d0"].mean().item()
-        # g_loss_val = loss_reduced["g"].mean().item()
-        # g_bg_loss_val = loss_reduced["g_bg"].mean().item()
-        # p_info_loss_val = loss_reduced["p_info"].mean().item()
-        # c_info_loss_val = loss_reduced["c_info"].mean().item()
-        # binary_loss_val = loss_reduced["bin"].mean().item()
-        # cvg_loss_val = loss_reduced["cvg"].mean().item()
-        # r1_val = loss_reduced["r1"].mean().item()
-        # path_loss_val = loss_reduced["path"].mean().item()
-        # real_score_val = loss_reduced["real_score"].mean().item()
-        # fake_score_val = loss_reduced["fake_score"].mean().item()
-        # path_length_val = loss_reduced["path_length"].mean().item()
+        accumulate(g_ema, g_module, accum)
 
-        # if get_rank() == 0:
-        #     pbar.set_description(
-        #         (
-        #             f"d: {d_loss_val:.4f}; d0: {d0_loss_val:.4f}; g: {g_loss_val:.4f}; g_bg: {g_bg_loss_val:.4f}; "
-        #             f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
-        #             f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
-        #             f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f};  r1: {r1_val:.4f};"
-        #             f"augment: {ada_aug_p:.4f}"
-        #         )
-        #     )
+        loss_reduced = reduce_loss_dict(loss_dict)
 
-        #     if wandb and args.wandb:
-        #         wandb.log(
-        #             {
-        #                 "Generator": g_loss_val,
-        #                 "Discriminator": d_loss_val,
-        #                 "BG_Generator": g_bg_loss_val,
-        #                 "BG_Discriminator": d0_loss_val,
-        #                 "p_info": p_info_loss_val,
-        #                 "c_info": c_info_loss_val,
-        #                 "Augment": ada_aug_p,
-        #                 "Rt": r_t_stat,
-        #                 "R1": r1_val,
-        #                 "Path Length Regularization": path_loss_val,
-        #                 "Mean Path Length": mean_path_length,
-        #                 "Real Score": real_score_val,
-        #                 "Fake Score": fake_score_val,
-        #                 "Path Length": path_length_val,
-        #             }
-        #         )
+        d_loss_val = loss_reduced["d"].mean().item()
+        d0_loss_val = loss_reduced["d0"].mean().item()
+        g_loss_val = loss_reduced["g"].mean().item()
+        g_bg_loss_val = loss_reduced["g_bg"].mean().item()
+        p_info_loss_val = loss_reduced["p_info"].mean().item()
+        c_info_loss_val = loss_reduced["c_info"].mean().item()
+        binary_loss_val = loss_reduced["bin"].mean().item()
+        cvg_loss_val = loss_reduced["cvg"].mean().item()
+        r1_val = loss_reduced["r1"].mean().item()
+        path_loss_val = loss_reduced["path"].mean().item()
+        real_score_val = loss_reduced["real_score"].mean().item()
+        fake_score_val = loss_reduced["fake_score"].mean().item()
+        path_length_val = loss_reduced["path_length"].mean().item()
 
-        #     if i % 1000 == 0:
-        #         with torch.no_grad():
-        #             g_ema.eval()
-        #             c_code = sample_c_code(args.n_sample, args.c_categories, device)
-        #             image_li, _, _ = g_ema([sample_z], c_code)
+        if get_rank() == 0:
+            pbar.set_description(
+                (
+                    f"d: {d_loss_val:.4f}; d0: {d0_loss_val:.4f}; g: {g_loss_val:.4f}; g_bg: {g_bg_loss_val:.4f}; "
+                    f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
+                    f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
+                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f};  r1: {r1_val:.4f};"
+                    f"augment: {ada_aug_p:.4f}"
+                )
+            )
 
-        #             utils.save_image(
-        #                 image_li[0],
-        #                 f"sample/{str(i).zfill(6)}_0.png",
-        #                 nrow=int(args.n_sample ** 0.5),
-        #                 normalize=True,
-        #                 range=(-1, 1),
-        #             )
+            if wandb and args.wandb:
+                wandb.log(
+                    {
+                        "Generator": g_loss_val,
+                        "Discriminator": d_loss_val,
+                        "BG_Generator": g_bg_loss_val,
+                        "BG_Discriminator": d0_loss_val,
+                        "p_info": p_info_loss_val,
+                        "c_info": c_info_loss_val,
+                        "Augment": ada_aug_p,
+                        "Rt": r_t_stat,
+                        "R1": r1_val,
+                        "Path Length Regularization": path_loss_val,
+                        "Mean Path Length": mean_path_length,
+                        "Real Score": real_score_val,
+                        "Fake Score": fake_score_val,
+                        "Path Length": path_length_val,
+                    }
+                )
 
-        #             for j in range(3):
-        #                 utils.save_image(
-        #                     image_li[1][j],
-        #                     f"sample/{str(i).zfill(6)}_{str(1+j)}.png",
-        #                     nrow=int(args.n_sample ** 0.5),
-        #                     normalize=True,
-        #                     range=(-1, 1),
-        #                 )
+            if i % 1000 == 0:
+                with torch.no_grad():
+                    g_ema.eval()
+                    c_code = sample_c_code(args.n_sample, args.c_categories, device)
+                    image_li, _, _ = g_ema([sample_z], c_code)
 
-        #             for j in range(3):
-        #                 utils.save_image(
-        #                     image_li[2][j],
-        #                     f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
-        #                     nrow=int(args.n_sample ** 0.5),
-        #                     normalize=True,
-        #                     range=(-1, 1),
-        #                 )
+                    utils.save_image(
+                        image_li[0],
+                        f"sample/{str(i).zfill(6)}_0.png",
+                        nrow=int(args.n_sample ** 0.5),
+                        normalize=True,
+                        range=(-1, 1),
+                    )
 
-        #             for j in range(2):
-        #                 utils.save_image(
-        #                     image_li[3][j],
-        #                     f"sample/{str(i).zfill(6)}_{str(7+j)}.png",
-        #                     nrow=int(args.n_sample ** 0.5),
-        #                     normalize=True,
-        #                     range=(0, 1),
-        #                 )
+                    for j in range(3):
+                        utils.save_image(
+                            image_li[1][j],
+                            f"sample/{str(i).zfill(6)}_{str(1+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(-1, 1),
+                        )
 
-        #     if i % 10000 == 0:
-        #         torch.save(
-        #             {
-        #                 "g": g_module.state_dict(),
-        #                 "d0": d_module0.state_dict(),
-        #                 "d1": d_module1.state_dict(),
-        #                 "d2": d_module2.state_dict(),
-        #                 "g_ema": g_ema.state_dict(),
-        #                 "g_optim": g_optim.state_dict(),
-        #                 "rf_optim2": rf_opt[2].state_dict(),
-        #                 "info_optim1": info_opt[1].state_dict(),
-        #                 "info_optim2": info_opt[2].state_dict(),
-        #                 "args": args,
-        #                 "ada_aug_p": ada_aug_p,
-        #             },
-        #             f"checkpoint/{str(i).zfill(6)}.pt",
-        #         )
+                    for j in range(3):
+                        utils.save_image(
+                            image_li[2][j],
+                            f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(-1, 1),
+                        )
+
+                    for j in range(2):
+                        utils.save_image(
+                            image_li[3][j],
+                            f"sample/{str(i).zfill(6)}_{str(7+j)}.png",
+                            nrow=int(args.n_sample ** 0.5),
+                            normalize=True,
+                            range=(0, 1),
+                        )
+
+            if i % 10000 == 0:
+                torch.save(
+                    {
+                        "g": g_module.state_dict(),
+                        "d0": d_module0.state_dict(),
+                        "d1": d_module1.state_dict(),
+                        "d2": d_module2.state_dict(),
+                        "g_ema": g_ema.state_dict(),
+                        "g_optim": g_optim.state_dict(),
+                        "rf_optim2": rf_opt[2].state_dict(),
+                        "info_optim1": info_opt[1].state_dict(),
+                        "info_optim2": info_opt[2].state_dict(),
+                        "args": args,
+                        "ada_aug_p": ada_aug_p,
+                    },
+                    f"checkpoint/{str(i).zfill(6)}.pt",
+                )
 
 
 if __name__ == "__main__":
@@ -620,19 +621,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--b_categories",
         type=int,
-        default=0,
+        default=200,
         help="number of background categories",
     )
     parser.add_argument(
         "--p_categories",
         type=int,
-        default=0,
+        default=20,
         help="number of parent categories",
     )
     parser.add_argument(
         "--c_categories",
         type=int,
-        default=0,
+        default=200,
         help="number of child categories",
     )
     parser.add_argument(
@@ -664,9 +665,7 @@ if __name__ == "__main__":
         args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
         args.p_size, channel_multiplier=args.channel_multiplier
     ).to(device)
-    # for name, param in generator.named_parameters():
-    #     print (name, param.size())
-    # sys.exit()
+
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, args.p_categories, args.c_categories,
         args.p_size, channel_multiplier=args.channel_multiplier

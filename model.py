@@ -621,11 +621,8 @@ class Generator(nn.Module):
             latent = torch.cat([latent, latent2], 1)
 
         if tied_code:
-            c_code = torch.empty(c_code.size(0), 0).to(c_code.device)
-            p_code = torch.empty(c_code.size(0), 0).to(c_code.device)
-            b_code = torch.empty(c_code.size(0), 0).to(c_code.device)
-            # p_code = self.child_to_parent(c_code)
-            # b_code = c_code
+            p_code = self.child_to_parent(c_code)
+            b_code = c_code
 
         bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
 
