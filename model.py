@@ -619,14 +619,14 @@ class Generator(nn.Module):
             p_code = self.child_to_parent(c_code)
             b_code = c_code
 
-        # bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
+        bg_skip_li = self.bg_generator(latent, None, b_code, noise=noise, randomize_noise=randomize_noise)
 
         fg_skip_li = self.fg_generator(latent, p_code, c_code, noise=noise, randomize_noise=randomize_noise)
 
-        # b_skip = bg_skip_li[-1]
+        b_skip = bg_skip_li[-1]
         p_skip = fg_skip_li[self.p_depth]
         c_skip = fg_skip_li[-1]
-        # b_image = b_skip[:, 0:3, :, :]
+        b_image = b_skip[:, 0:3, :, :]
         p_image = p_skip[:, 0:3, :, :]
         p_mask = p_skip[:, 3:4, :, :]
         p_mask = torch.sigmoid(p_mask)

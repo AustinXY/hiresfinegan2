@@ -434,7 +434,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_sample",
         type=int,
-        default=16,
+        default=0,
         help="number of the samples generated during training",
     )
     parser.add_argument(
