@@ -14,7 +14,7 @@ from tqdm import tqdm
 from prepare_data import IMIM
 
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="3"
 
 try:
     import wandb
@@ -206,7 +206,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         mask = mask.to(device)
 
         ############# train bg discriminator #############
-        requires_grad(generator, True)
+        requires_grad(generator, False)
         requires_grad(netsD[0], True)
         requires_grad(netsD[1], False)
         requires_grad(netsD[2], False)
@@ -321,7 +321,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         image_li, code_li, _ = generator(noise, c_code)
         fake_img = image_li[0]
         mkd_images = image_li[2]
-        # masks = image_li[3]
+        masks = image_li[3]
         p_code = code_li[1]
         c_code = code_li[2]
 
@@ -353,23 +353,23 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
-        # binary_loss = binarization_loss(masks[1]) * 0
-        binary_loss = torch.zeros(1).to(device)
+        binary_loss = binarization_loss(masks[1]) * 1e1
+        # binary_loss = torch.zeros(1).to(device)
         # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
-        # ms = masks[1].size()
-        # min_fg_cvg = 0.2 * ms[2] * ms[3]
-        # fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 0
-        fg_cvg_loss = torch.zeros(1).to(device)
+        ms = masks[1].size()
+        min_fg_cvg = 0.2 * ms[2] * ms[3]
+        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 1e-1
+        # fg_cvg_loss = torch.zeros(1).to(device)
 
-        # ms = masks[1].size()
-        # min_bg_cvg = 0.2 * ms[2] * ms[3]
-        # bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 0
-        bg_cvg_loss = torch.zeros(1).to(device)
+        ms = masks[1].size()
+        min_bg_cvg = 0.2 * ms[2] * ms[3]
+        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 1e-1
+        # bg_cvg_loss = torch.zeros(1).to(device)
 
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss #+ binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
@@ -788,6 +788,6 @@ if __name__ == "__main__":
 
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan2 bg patchgan")
+        wandb.init(project="stylegan2 bg patchgan stitch")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
