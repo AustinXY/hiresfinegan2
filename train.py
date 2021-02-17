@@ -470,7 +470,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     utils.save_image(
                         image_li[0],
                         f"sample/{str(i).zfill(6)}_0.png",
-                        nrow=int(args.n_sample ** 0.5),
+                        nrow=8,
                         normalize=True,
                         range=(-1, 1),
                     )
@@ -479,7 +479,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         utils.save_image(
                             image_li[1][j],
                             f"sample/{str(i).zfill(6)}_{str(1+j)}.png",
-                            nrow=int(args.n_sample ** 0.5),
+                            nrow=8,
                             normalize=True,
                             range=(-1, 1),
                         )
@@ -488,7 +488,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         utils.save_image(
                             image_li[2][j],
                             f"sample/{str(i).zfill(6)}_{str(4+j)}.png",
-                            nrow=int(args.n_sample ** 0.5),
+                            nrow=8,
                             normalize=True,
                             range=(-1, 1),
                         )
@@ -497,7 +497,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         utils.save_image(
                             image_li[3][j],
                             f"sample/{str(i).zfill(6)}_{str(7+j)}.png",
-                            nrow=int(args.n_sample ** 0.5),
+                            nrow=8,
                             normalize=True,
                             range=(0, 1),
                         )
