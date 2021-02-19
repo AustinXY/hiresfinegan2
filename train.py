@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 # try:
 import wandb
@@ -387,23 +387,19 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         loss_dict["p_info"] = p_info_loss
         loss_dict["c_info"] = c_info_loss
 
-        # binary_loss = binarization_loss(masks[1]) * 0
-        binary_loss = torch.zeros(1).to(device)
+        binary_loss = binarization_loss(masks[1]) * 1e1
         # oob_loss = torch.sum(bg_mk * ch_mk, dim=(-1,-2)).mean() * 1e-2
         ms = masks[1].size()
         min_fg_cvg = 0.2 * ms[2] * ms[3]
-        # fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 0
-        fg_cvg_loss = torch.zeros(1).to(device)
+        fg_cvg_loss = F.relu(min_fg_cvg - torch.sum(masks[1], dim=(-1,-2))).mean() * 1e-1
 
-        ms = masks[1].size()
         min_bg_cvg = 0.2 * ms[2] * ms[3]
-        # bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 0
-        bg_cvg_loss = torch.zeros(1).to(device)
+        bg_cvg_loss = F.relu(min_bg_cvg - torch.sum(torch.ones_like(masks[1])-masks[1], dim=(-1,-2))).mean() * 1e-1
 
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss # + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g_loss + g_bg_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
@@ -573,7 +569,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             range=(0, 1),
                         )
 
-            if i % 10000 == 0:
+            if i % 10000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -728,7 +724,7 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
-    args.bg_loss_wt = 1e-1
+    args.bg_loss_wt = 1e0
 
     args.start_iter = 0
 
@@ -745,9 +741,9 @@ if __name__ == "__main__":
 
     generator = Generator(
         z_dim               = args.latent,              # Input latent (Z) dimensionality.
-        b_dim = 0,#               = args.b_dim,               # Conditioning label (C) dimensionality.
-        p_dim = 0,#                = args.p_dim,               # Conditioning label (C) dimensionality.
-        c_dim = 0,#          = args.c_dim,               # Conditioning label (C) dimensionality.
+        b_dim               = args.b_dim,               # Conditioning label (C) dimensionality.
+        p_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
+        c_dim               = args.c_dim,               # Conditioning label (C) dimensionality.
         w_dim               = args.w_dim,               # Intermediate latent (W) dimensionality.
         img_resolution      = args.size,                # Output resolution.
         img_channels        = 4,                        # Number of output color channels.
@@ -800,6 +796,8 @@ if __name__ == "__main__":
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
+    # g_reg_ratio = 1
+    # d_reg_ratio = 1
 
     g_optim = optim.Adam(
         generator.parameters(),
@@ -807,17 +805,17 @@ if __name__ == "__main__":
         betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
 
-    d_optim0 = optim.Adam(
+    rf_optim0 = optim.Adam(
         netsD[0].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
-    d_optim2 = optim.Adam(
+    rf_optim2 = optim.Adam(
         netsD[2].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
-    rf_opt = [d_optim0, None, d_optim2]
+    rf_opt = [rf_optim0, None, rf_optim2]
 
     info_optim1 = optim.Adam(
         netsD[1].parameters(),
@@ -825,7 +823,7 @@ if __name__ == "__main__":
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     info_optim2 = optim.Adam(
-        netsD[2].parameters(),
+        netsD[2].b4.pred_linear.parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
@@ -885,7 +883,7 @@ if __name__ == "__main__":
 
     transform = transforms.Compose(
         [
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
         ]
@@ -900,6 +898,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan io")
+        wandb.init(project="stylegan 2 pgan io stitch")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
