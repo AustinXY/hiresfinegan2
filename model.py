@@ -642,12 +642,12 @@ class Generator(nn.Module):
         b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
         p_mkd = p_mask * p_image
         c_mkd = c_mask * c_image
-        # fnl_image = b_mkd + c_mkd
-        fnl_image = c_image
+        fnl_image = b_mkd + c_mkd
+        # fnl_image = c_image
 
         raw_images = [b_image, p_image, c_image]
-        # mkd_images = [b_mkd, p_mkd, c_mkd]
-        mkd_images = raw_images
+        mkd_images = [b_mkd, p_mkd, c_mkd]
+        # mkd_images = raw_images
         masks = [p_mask, c_mask]
 
         if return_latents:
