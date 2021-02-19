@@ -206,7 +206,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         mask = mask.to(device)
 
         ############# train bg discriminator #############
-        requires_grad(generator, True)
+        requires_grad(generator, False)
         requires_grad(netsD[0], True)
         requires_grad(netsD[1], False)
         requires_grad(netsD[2], False)
