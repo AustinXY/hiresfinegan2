@@ -898,6 +898,5 @@ class D_NET_BG(nn.Module):
                 y_code = self.from_RGB_net[i-1](y_var)
                 x_code = (1 - alpha) * y_code + alpha * x_code
 
-        classi_score = x_code[0]
         rf_score = x_code[1]
-        return [rf_score, classi_score, mask]
+        return [rf_score, None, mask]

@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 
 # try:
 import wandb
@@ -99,7 +99,6 @@ def d_r1_loss(real_pred, real_img):
 
 def g_nonsaturating_loss(fake_pred):
     loss = F.softplus(-fake_pred).mean()
-
     return loss
 
 
@@ -107,14 +106,14 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
-    # grad_bg, = autograd.grad(
-    #     outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
-    # )
+    grad_bg, = autograd.grad(
+        outputs=(fake_img * noise).sum(), inputs=latents[0], create_graph=True
+    )
     grad_fg, = autograd.grad(
         outputs=(fake_img * noise).sum(), inputs=latents[1], create_graph=True
     )
-    grad = grad_fg
-    # grad = grad_bg + grad_fg
+    # grad = grad_fg
+    grad = grad_bg + grad_fg
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
@@ -262,9 +261,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         errD_real_uncond = torch.mul(errD_real_uncond, weights_real)  # Masking output units which correspond to receptive fields which lie within the boundin box
         errD_real_uncond = errD_real_uncond.mean()
 
-        errD_real_uncond_classi = criterion(real_logits[1], weights_real)  # Background/foreground classification loss
-        errD_real_uncond_classi = errD_real_uncond_classi.mean()
-
         fake_logits = netsD[0](fake_bg, mask=None)
 
         fake_labels = torch.zeros_like(fake_logits[0])
@@ -281,7 +277,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
             errD_real = errD_real_uncond
 
         errD_fake = errD_fake_uncond
-        errD = ((errD_real + errD_fake) * args.bg_loss_wt) + errD_real_uncond_classi
+        errD = (errD_real + errD_fake) * args.bg_loss_wt
 
         loss_dict["d0"] = errD
 
@@ -366,8 +362,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         output = netsD[0](fake_bg)
         real_labels = torch.ones_like(output[0])
         g_bg_loss = criterion_one(output[0], real_labels) * args.bg_loss_wt
-        errG_classi = criterion_one(output[1], real_labels) # Background/Foreground classification loss for the fake background image (on patch level)
-        g_bg_loss += errG_classi
 
         loss_dict["g_bg"] = g_bg_loss
 
@@ -724,7 +718,7 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
-    args.bg_loss_wt = 1e0
+    args.bg_loss_wt = 1e1
 
     args.start_iter = 0
 
