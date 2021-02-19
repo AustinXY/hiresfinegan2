@@ -892,6 +892,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan io stitch")
+        wandb.init(project="stylegan 2 pgan io")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
