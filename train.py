@@ -36,7 +36,6 @@ from distributed import (
 from non_leaking import augment, AdaptiveAugment
 
 
-
 def weights_init(m):
     classname = m.__class__.__name__
     if isinstance(m, nn.Conv2d):
@@ -740,7 +739,7 @@ if __name__ == "__main__":
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,                    # Overall multiplier for the number of channels.
         channel_max         = 512,                      # Maximum number of channels in any layer.
-        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
+        num_fp16_res        = 0,                        # Use FP16 for the N highest resolutions.
         conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
