@@ -1,7 +1,7 @@
 import torch
 import os
 
-gpu_li = [str(i) for i in [2,3]]
+gpu_li = [str(i) for i in [0,2,3]]
 
 tensor_li = []
 for i in gpu_li:

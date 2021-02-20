@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 # try:
 import wandb
@@ -22,7 +22,7 @@ import wandb
 # except ImportError:
 #     wandb = None
 
-from model import Generator, Discriminator, D_NET_BG
+from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG
 from dataset import MultiResolutionDataset
 from prepare_data import IMIM
 
@@ -221,8 +221,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
     grid_c = grid_c.split(8)
 
     criterion_class = nn.CrossEntropyLoss()
-    criterion = nn.BCELoss(reduction='none')
-    criterion_one = nn.BCELoss()
+    # criterion = nn.BCELoss(reduction='none')
+    # criterion_one = nn.BCELoss()
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -235,7 +235,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         real_img = real_img.to(device)
         mask = mask.to(device)
 
-
         ############# train bg discriminator #############
         generator.requires_grad_(False)
         netsD[0].requires_grad_(True)
@@ -247,37 +246,19 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         raw_images = image_li[1]
         fake_bg = raw_images[0]
 
-        real_logits = netsD[0](real_img, mask=mask)
+        real_pred = netsD[0](real_img)
+        fnl_masks = netsD[3](mask)
+        fake_pred = netsD[0](fake_bg)
 
-        rf_scores, _, fnl_masks = real_logits
-        weights_real = torch.ones_like(rf_scores)
-
+        weights_real = torch.ones_like(real_pred)
         invalid_patch = fnl_masks != 0.0
         weights_real.masked_fill_(invalid_patch, 0.0)
 
-        real_labels = torch.ones_like(rf_scores)
+        real_loss = F.softplus(-real_pred)
+        real_loss = torch.sum(real_loss * weights_real) / torch.sum(weights_real)
 
-        errD_real_uncond = criterion(real_logits[0], real_labels)  # Real/Fake loss for 'real background' (on patch level)
-        errD_real_uncond = torch.mul(errD_real_uncond, weights_real)  # Masking output units which correspond to receptive fields which lie within the boundin box
-        errD_real_uncond = errD_real_uncond.mean()
-
-        fake_logits = netsD[0](fake_bg, mask=None)
-
-        fake_labels = torch.zeros_like(fake_logits[0])
-
-        errD_fake_uncond = criterion(fake_logits[0], fake_labels)  # Real/Fake loss for 'fake background' (on patch level)
-        errD_fake_uncond = errD_fake_uncond.mean()
-
-        norm_fact_real = weights_real.sum()
-        norm_fact_fake = weights_real.shape[0]*weights_real.shape[1]*weights_real.shape[2]*weights_real.shape[3]
-
-        if norm_fact_real > 0:    # Normalizing the real/fake loss for background after accounting the number of masked members in the output.
-            errD_real = errD_real_uncond * ((norm_fact_fake * 1.0) /(norm_fact_real * 1.0))
-        else:
-            errD_real = errD_real_uncond
-
-        errD_fake = errD_fake_uncond
-        errD = (errD_real + errD_fake) * args.bg_loss_wt
+        fake_loss = F.softplus(fake_pred).mean()
+        errD = real_loss + fake_loss
 
         loss_dict["d0"] = errD
 
@@ -359,9 +340,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         # background rf
         fake_bg = raw_images[0]
-        output = netsD[0](fake_bg)
-        real_labels = torch.ones_like(output[0])
-        g_bg_loss = criterion_one(output[0], real_labels) * args.bg_loss_wt
+        fake_pred = netsD[0](fake_bg)
+        g_bg_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g_bg"] = g_bg_loss
 
@@ -572,6 +552,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         "d2": d_module2.state_dict(),
                         "g_ema": g_ema.state_dict(),
                         "g_optim": g_optim.state_dict(),
+                        "rf_optim0": rf_opt[0].state_dict(),
                         "rf_optim2": rf_opt[2].state_dict(),
                         "info_optim1": info_opt[1].state_dict(),
                         "info_optim2": info_opt[2].state_dict(),
@@ -753,9 +734,18 @@ if __name__ == "__main__":
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
 
-    depth = int(math.log(args.size, 2))-5
-    netD0 = D_NET_BG(depth).to(device)
-    netD0.apply(weights_init)
+    netD0 = Discriminator_BG(
+        img_resolution      = args.size,               # Input resolution.
+        img_channels        = 3,                        # Number of input color channels.
+        architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
+        channel_base        = 32768,                    # Overall multiplier for the number of channels.
+        channel_max         = 512,                      # Maximum number of channels in any layer.
+        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
+        conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
+        cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
+        block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
+        # epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+    ).train().requires_grad_(False).to(device)
 
     netD1 = Discriminator(
         c_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
@@ -786,12 +776,25 @@ if __name__ == "__main__":
         mapping_kwargs      = {},                       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
     ).train().requires_grad_(False).to(device)
-    netsD = [netD0, netD1, netD2]
 
-    g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
-    d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
-    # g_reg_ratio = 1
-    # d_reg_ratio = 1
+    netD3 = Discriminator_BG_BBOX(
+        img_resolution      = args.size,                # Input resolution.
+        img_channels        = 1,                        # Number of input color channels.
+        architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
+        # channel_base        = 32768,                    # Overall multiplier for the number of channels.
+        # channel_max         = 512,                      # Maximum number of channels in any layer.
+        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
+        conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
+        cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
+        block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
+        # epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+    ).train().requires_grad_(False).to(device)
+    netsD = [netD0, netD1, netD2, netD3]
+
+    # g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
+    # d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
+    g_reg_ratio = 1
+    d_reg_ratio = 1
 
     g_optim = optim.Adam(
         generator.parameters(),
@@ -842,8 +845,8 @@ if __name__ == "__main__":
         g_ema.load_state_dict(ckpt["g_ema"])
 
         g_optim.load_state_dict(ckpt["g_optim"])
-        rf_opt[0].load_state_dict(ckpt["d_optim0"])
-        rf_opt[2].load_state_dict(ckpt["rf_optim"])
+        rf_opt[0].load_state_dict(ckpt["rf_optim0"])
+        rf_opt[2].load_state_dict(ckpt["rf_optim2"])
 
         info_opt[1].load_state_dict(ckpt["info_optim1"])
         info_opt[2].load_state_dict(ckpt["info_optim2"])
