@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -699,7 +699,7 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
-    args.bg_loss_wt = 1e1
+    # args.bg_loss_wt = 1e0
 
     args.start_iter = 0
 
