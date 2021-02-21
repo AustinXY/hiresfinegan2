@@ -693,6 +693,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.img_channels = img_channels
         self.architecture = architecture
         self.predict_c = predict_c
+        self.c_dim = c_dim
 
         if architecture == 'skip':
             self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
@@ -700,7 +701,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
         self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
         self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
-        if predict_c:
+        if predict_c and c_dim > 0:
             self.pred_linear = FullyConnectedLayer(in_channels, c_dim)
 
     def forward(self, x, img, cmap, force_fp32=False):
@@ -723,6 +724,9 @@ class DiscriminatorEpilogue(torch.nn.Module):
         x = self.fc(x.flatten(1))
         _x = self.out(x)
         if self.predict_c:
+            if self.c_dim == 0:
+                return _x
+
             _c = self.pred_linear(x)
             return [_x, _c]
 

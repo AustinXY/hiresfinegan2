@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -174,12 +174,12 @@ def mask_to_bbox(mask, threshold=0.8):
     for i in range(mask.size(0)):
         crd = torch.nonzero(mask[i, 0] >= threshold)
         if crd.size(0) == 0:
-            x1, x2, y1, y2 = (0., -1., 0., -1.)
+            x1, x2, y1, y2 = (0, -1, 0, -1)
         else:
-            x1 = torch.min(crd[:,1]).item()
-            x2 = torch.max(crd[:,1]).item()
-            y1 = torch.min(crd[:,0]).item()
-            y2 = torch.max(crd[:,0]).item()
+            x1 = int(torch.min(crd[:,1]).item())
+            x2 = int(torch.max(crd[:,1]).item())
+            y1 = int(torch.min(crd[:,0]).item())
+            y2 = int(torch.max(crd[:,0]).item())
         bbox[i][0][y1: y2+1, x1: x2+1] = 1
     return bbox
 
@@ -261,31 +261,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         fg_mask = image_li[3][1]
         fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
 
-        real_pred = netsD[0](real_img)
-        real_fnl_bbox = netsD[3](real_bbox)
-        fake_pred = netsD[0](fake_img)
-        fake_fnl_bbox = netsD[3](fake_bbox)
+        real_pred = netsD[0](real_img * real_bbox)
+        fake_pred = netsD[0](fake_img * fake_bbox)
+        d0_loss = d_logistic_loss(real_pred, fake_pred)
 
-        invalid_patch = real_fnl_bbox != 0.0
-        weights_real = torch.zeros_like(real_fnl_bbox).masked_fill(invalid_patch, 1.)
-        weights_fake = torch.ones_like(real_fnl_bbox) - real_fnl_bbox
-        real_real = torch.sum(F.softplus(-real_pred) * weights_real) / torch.sum(weights_real)
-        real_fake = torch.sum(F.softplus(real_pred) * weights_fake) / torch.sum(weights_fake)
-        real_loss = real_real + real_fake
-
-        invalid_patch = fake_fnl_bbox != 0.0
-        weights_real = torch.zeros_like(fake_fnl_bbox).masked_fill(invalid_patch, 1.)
-        weights_fake = torch.ones_like(fake_fnl_bbox) - fake_fnl_bbox
-        fake_real = torch.sum(F.softplus(fake_pred) * weights_real) / torch.sum(weights_real)
-        fake_fake = torch.sum(F.softplus(-fake_pred) * weights_fake) / torch.sum(weights_fake)
-        fake_loss = fake_real + fake_fake
-
-        errD = real_loss + fake_loss
-
-        loss_dict["d0"] = errD
+        loss_dict["d0"] = d0_loss
 
         netsD[0].zero_grad()
-        errD.backward()
+        d0_loss.backward()
         rf_opt[0].step()
 
         ############# train child discriminator #############
@@ -363,16 +346,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         # background rf
         fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
-
-        fake_pred = netsD[0](fake_img)
-        fake_fnl_bbox = netsD[3](fake_bbox)
-
-        invalid_patch = fake_fnl_bbox != 0.0
-        weights_real = torch.zeros_like(fake_fnl_bbox).masked_fill(invalid_patch, 1.)
-        weights_fake = torch.ones_like(fake_fnl_bbox) - fake_fnl_bbox
-        fake_real = torch.sum(F.softplus(-fake_pred) * weights_real) / torch.sum(weights_real)
-        fake_fake = torch.sum(F.softplus(fake_pred) * weights_fake) / torch.sum(weights_fake)
-        g_bg_loss = fake_real + fake_fake
+        fake_pred = netsD[0](fake_img * fake_bbox)
+        g_bg_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g_bg"] = g_bg_loss
 
@@ -537,12 +512,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         for j in range(2):
                             if masks[j] is None:
                                 masks[j] = image_li[3][j]
-                                if j == 1:
-                                    bboxes = mask_to_bbox(image_li[3][j], args.threshold)
                             else:
                                 masks[j] = torch.cat([masks[j], image_li[3][j]])
-                                if j == 1:
-                                    bboxes = torch.cat([bboxes, mask_to_bbox(image_li[3][j], args.threshold)])
+
+                        bbox = mask_to_bbox(image_li[3][1], args.threshold)
+                        if bboxes is None:
+                            bboxes = bbox * image_li[0]
+                        else:
+                            bboxes = torch.cat([bboxes, bbox * image_li[0]])
 
                     utils.save_image(
                         fnl_image,
@@ -584,7 +561,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         f"sample/{str(i).zfill(6)}_{str(9)}.png",
                         nrow=8,
                         normalize=True,
-                        range=(0, 1),
+                        range=(-1, 1),
                     )
 
             if i % 10000 == 0 and i != 0:
@@ -779,17 +756,20 @@ if __name__ == "__main__":
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
 
-    netD0 = Discriminator_BG(
-        img_resolution      = args.size,               # Input resolution.
+    netD0 = Discriminator(
+        c_dim               = 0,                        # Conditioning label (C) dimensionality.
+        img_resolution      = args.size,                # Input resolution.
         img_channels        = 3,                        # Number of input color channels.
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,                    # Overall multiplier for the number of channels.
         channel_max         = 512,                      # Maximum number of channels in any layer.
-        num_fp16_res        = 0,                        # Use FP16 for the N highest resolutions.
+        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
         conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
-        # epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+        mapping_kwargs      = {},                       # Arguments for MappingNetwork.
+        epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+        predict_c           = True,                    # If predict c, then info discriminator, else conditional discriminator.
     ).train().requires_grad_(False).to(device)
 
     netD1 = Discriminator(
@@ -805,6 +785,7 @@ if __name__ == "__main__":
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},                       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+        predict_c           = True,                     # If predict c, then info discriminator, else conditional discriminator.
     ).train().requires_grad_(False).to(device)
 
     netD2 = Discriminator(
@@ -820,21 +801,9 @@ if __name__ == "__main__":
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},                       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+        predict_c           = True,                     # If predict c, then info discriminator, else conditional discriminator.
     ).train().requires_grad_(False).to(device)
-
-    netD3 = Discriminator_BG_BBOX(
-        img_resolution      = args.size,                # Input resolution.
-        img_channels        = 1,                        # Number of input color channels.
-        architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
-        # channel_base        = 32768,                    # Overall multiplier for the number of channels.
-        # channel_max         = 512,                      # Maximum number of channels in any layer.
-        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
-        conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
-        cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
-        block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
-        # epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
-    ).train().requires_grad_(False).to(device)
-    netsD = [netD0, netD1, netD2, netD3]
+    netsD = [netD0, netD1, netD2]
 
     # g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     # d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -940,6 +909,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan io classi")
+        wandb.init(project="stylegan 2 pgan io roi")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
