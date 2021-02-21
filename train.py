@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="3"
 
 # try:
 import wandb
@@ -164,8 +164,25 @@ def sample_codes(batch, latent_dim, b_dim, p_dim, c_dim, device):
     b = c.clone()
     return z, b, p, c
 
+
 def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
+
+
+def mask_to_bbox(mask, threshold=0.8):
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        crd = torch.nonzero(mask[i, 0] >= threshold)
+        if crd.size(0) == 0:
+            x1, x2, y1, y2 = (0., -1., 0., -1.)
+        else:
+            x1 = torch.min(crd[:,1]).item()
+            x2 = torch.max(crd[:,1]).item()
+            y1 = torch.min(crd[:,0]).item()
+            y2 = torch.max(crd[:,0]).item()
+        bbox[i][0][y1: y2+1, x1: x2+1] = 1
+    return bbox
+
 
 def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
     loader = sample_data(loader)
@@ -220,8 +237,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
     grid_c = grid_c.split(8)
 
     criterion_class = nn.CrossEntropyLoss()
-    # criterion = nn.BCELoss(reduction='none')
-    # criterion_one = nn.BCELoss()
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -230,9 +245,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
             print("Done!")
             break
 
-        real_img, mask = next(loader)
+        real_img, real_bbox = next(loader)
         real_img = real_img.to(device)
-        mask = mask.to(device)
+        real_bbox = real_bbox.to(device)
 
         ############# train bg discriminator #############
         generator.requires_grad_(False)
@@ -242,21 +257,29 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
         image_li = generator(z, b, p, c, mix_style=True)
-        raw_images = image_li[1]
-        fake_bg = raw_images[0]
+        fake_img = image_li[0]
+        fg_mask = image_li[3][1]
+        fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
 
         real_pred = netsD[0](real_img)
-        fnl_masks = netsD[3](mask)
-        fake_pred = netsD[0](fake_bg)
+        real_fnl_bbox = netsD[3](real_bbox)
+        fake_pred = netsD[0](fake_img)
+        fake_fnl_bbox = netsD[3](fake_bbox)
 
-        weights_real = torch.ones_like(real_pred)
-        invalid_patch = fnl_masks != 0.0
-        weights_real.masked_fill_(invalid_patch, 0.0)
+        invalid_patch = real_fnl_bbox != 0.0
+        weights_real = torch.zeros_like(real_fnl_bbox).masked_fill(invalid_patch, 1.)
+        weights_fake = torch.ones_like(real_fnl_bbox) - real_fnl_bbox
+        real_real = torch.sum(F.softplus(-real_pred) * weights_real) / torch.sum(weights_real)
+        real_fake = torch.sum(F.softplus(real_pred) * weights_fake) / torch.sum(weights_fake)
+        real_loss = real_real + real_fake
 
-        real_loss = F.softplus(-real_pred)
-        real_loss = torch.sum(real_loss * weights_real) / torch.sum(weights_real)
+        invalid_patch = fake_fnl_bbox != 0.0
+        weights_real = torch.zeros_like(fake_fnl_bbox).masked_fill(invalid_patch, 1.)
+        weights_fake = torch.ones_like(fake_fnl_bbox) - fake_fnl_bbox
+        fake_real = torch.sum(F.softplus(fake_pred) * weights_real) / torch.sum(weights_real)
+        fake_fake = torch.sum(F.softplus(-fake_pred) * weights_fake) / torch.sum(weights_fake)
+        fake_loss = fake_real + fake_fake
 
-        fake_loss = F.softplus(fake_pred).mean()
         errD = real_loss + fake_loss
 
         loss_dict["d0"] = errD
@@ -333,14 +356,23 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         raw_images = image_li[1]
         mkd_images = image_li[2]
         masks = image_li[3]
+        fg_mask = masks[1]
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         # background rf
-        fake_bg = raw_images[0]
-        fake_pred = netsD[0](fake_bg)
-        g_bg_loss = g_nonsaturating_loss(fake_pred)
+        fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
+
+        fake_pred = netsD[0](fake_img)
+        fake_fnl_bbox = netsD[3](fake_bbox)
+
+        invalid_patch = fake_fnl_bbox != 0.0
+        weights_real = torch.zeros_like(fake_fnl_bbox).masked_fill(invalid_patch, 1.)
+        weights_fake = torch.ones_like(fake_fnl_bbox) - fake_fnl_bbox
+        fake_real = torch.sum(F.softplus(-fake_pred) * weights_real) / torch.sum(weights_real)
+        fake_fake = torch.sum(F.softplus(fake_pred) * weights_fake) / torch.sum(weights_fake)
+        g_bg_loss = fake_real + fake_fake
 
         loss_dict["g_bg"] = g_bg_loss
 
@@ -698,6 +730,7 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
+    args.threshold = 0.8
     # args.bg_loss_wt = 1e0
 
     args.start_iter = 0
