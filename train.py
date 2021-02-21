@@ -174,12 +174,12 @@ def mask_to_bbox(mask, threshold=0.8):
     for i in range(mask.size(0)):
         crd = torch.nonzero(mask[i, 0] >= threshold)
         if crd.size(0) == 0:
-            x1, x2, y1, y2 = (0., -1., 0., -1.)
+            x1, x2, y1, y2 = (0, -1, 0, -1)
         else:
-            x1 = torch.min(crd[:,1]).item()
-            x2 = torch.max(crd[:,1]).item()
-            y1 = torch.min(crd[:,0]).item()
-            y2 = torch.max(crd[:,0]).item()
+            x1 = int(torch.min(crd[:,1]).item())
+            x2 = int(torch.max(crd[:,1]).item())
+            y1 = int(torch.min(crd[:,0]).item())
+            y2 = int(torch.max(crd[:,0]).item())
         bbox[i][0][y1: y2+1, x1: x2+1] = 1
     return bbox
 
@@ -537,12 +537,13 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         for j in range(2):
                             if masks[j] is None:
                                 masks[j] = image_li[3][j]
-                                if j == 1:
-                                    bboxes = mask_to_bbox(image_li[3][j], args.threshold)
                             else:
                                 masks[j] = torch.cat([masks[j], image_li[3][j]])
-                                if j == 1:
-                                    bboxes = torch.cat([bboxes, mask_to_bbox(image_li[3][j], args.threshold)])
+
+                        if bboxes is None:
+                            bboxes = mask_to_bbox(image_li[3][j], args.threshold)
+                        else:
+                            bboxes = torch.cat([bboxes, mask_to_bbox(image_li[3][j], args.threshold)])
 
                     utils.save_image(
                         fnl_image,
