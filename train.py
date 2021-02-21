@@ -515,6 +515,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                     raw_images = [None, None, None]
                     mkd_images = [None, None, None]
                     masks = [None, None]
+                    bboxes = None
                     for image_li in image_li_li:
                         if fnl_image is None:
                             fnl_image = image_li[0]
@@ -536,8 +537,12 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         for j in range(2):
                             if masks[j] is None:
                                 masks[j] = image_li[3][j]
+                                if j == 1:
+                                    bboxes = mask_to_bbox(image_li[3][j], args.threshold)
                             else:
                                 masks[j] = torch.cat([masks[j], image_li[3][j]])
+                                if j == 1:
+                                    bboxes = torch.cat([bboxes, mask_to_bbox(image_li[3][j], args.threshold)])
 
                     utils.save_image(
                         fnl_image,
@@ -573,6 +578,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             normalize=True,
                             range=(0, 1),
                         )
+
+                    utils.save_image(
+                        bboxes,
+                        f"sample/{str(i).zfill(6)}_{str(9)}.png",
+                        nrow=8,
+                        normalize=True,
+                        range=(0, 1),
+                    )
 
             if i % 10000 == 0 and i != 0:
                 torch.save(
@@ -927,6 +940,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan io")
+        wandb.init(project="stylegan 2 pgan io classi")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
