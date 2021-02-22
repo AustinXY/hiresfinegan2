@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 
 # try:
 import wandb
@@ -254,9 +254,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         weights_real.masked_fill_(invalid_patch, 0.0)
 
         real_loss = F.softplus(-real_pred)
-        real_loss = torch.sum(real_loss * weights_real) / torch.sum(weights_real)
+        real_loss = (torch.sum(real_loss * weights_real) / torch.sum(weights_real)) * args.bg_wt
 
-        fake_loss = F.softplus(fake_pred).mean()
+        fake_loss = F.softplus(fake_pred).mean() * args.bg_wt
         errD = real_loss + fake_loss
 
         loss_dict["d0"] = errD
@@ -340,7 +340,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         # background rf
         fake_bg = raw_images[0]
         fake_pred = netsD[0](fake_bg)
-        g_bg_loss = g_nonsaturating_loss(fake_pred)
+        g_bg_loss = g_nonsaturating_loss(fake_pred) * args.bg_wt
 
         loss_dict["g_bg"] = g_bg_loss
 
@@ -698,7 +698,7 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
-    # args.bg_loss_wt = 1e0
+    args.bg_wt = 3
 
     args.start_iter = 0
 
