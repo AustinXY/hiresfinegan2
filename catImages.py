@@ -2,7 +2,7 @@ from PIL import Image
 import os
 
 
-count = 211000
+count = 60000
 
 
 def get_concat_v(im1, im2):
@@ -19,7 +19,7 @@ def generate_imgpath(count, i):
 
 im_path = generate_imgpath(count, 0)
 im = Image.open(im_path)
-for i in range(1, 9):
+for i in range(1, 10):
     _im_path = generate_imgpath(count, i)
     _im = Image.open(_im_path)
     im = get_concat_v(im, _im)

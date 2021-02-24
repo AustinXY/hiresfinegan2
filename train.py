@@ -11,8 +11,9 @@ from torch import nn, autograd, optim
 from torch.nn import functional as F
 from torch.utils import data
 import torch.distributed as dist
-from torchvision import transforms, utils
+from torchvision import transforms, utils, ops
 from tqdm import tqdm
+from torch_utils import image_transforms
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
@@ -169,19 +170,57 @@ def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
 
 
-def mask_to_bbox(mask, threshold=0.8):
-    bbox = torch.zeros_like(mask)
+def get_bbox_coord(mask, threshold=0.8):
+    bbox_coord = torch.empty(0, 4)
     for i in range(mask.size(0)):
-        crd = torch.nonzero(mask[i, 0] >= threshold)
-        if crd.size(0) == 0:
+        coord = torch.nonzero(mask[i, 0] >= threshold)
+        if coord.size(0) == 0:
             x1, x2, y1, y2 = (0, -1, 0, -1)
         else:
-            x1 = int(torch.min(crd[:,1]).item())
-            x2 = int(torch.max(crd[:,1]).item())
-            y1 = int(torch.min(crd[:,0]).item())
-            y2 = int(torch.max(crd[:,0]).item())
+            x1 = torch.min(coord[:,1]).item()
+            x2 = torch.max(coord[:,1]).item()
+            y1 = torch.min(coord[:,0]).item()
+            y2 = torch.max(coord[:,0]).item()
+        bbox_coord = torch.cat((bbox_coord, torch.tensor([[x1, y1, x2, y2]],dtype=torch.float)))
+    return bbox_coord
+
+
+def mask_to_bbox(mask, threshold=0.8):
+    bbox_coord = get_bbox_coord(mask, threshold)
+    bbox = torch.zeros_like(mask)
+    for i, coord in enumerate(bbox_coord):
+        x1, y1, x2, y2 = coord.int()
         bbox[i][0][y1: y2+1, x1: x2+1] = 1
     return bbox
+
+def box_convert(bbox):
+    _bbox = bbox.clone()
+    _bbox[:, 2] = _bbox[:, 2] - _bbox[:, 0]
+    _bbox[:, 3] = _bbox[:, 3] - _bbox[:, 1]
+    return _bbox
+
+def bbox_resize(bbox, img, threshold=0.8):
+    bbox_coord = get_bbox_coord(bbox, threshold)
+    roi_resized = torch.zeros_like(img)
+
+    try:
+        _bbox = ops.box_convert(bbox_coord, in_fmt='xyxy', out_fmt='xywh')
+    except:
+        _bbox = box_convert(bbox_coord)
+
+    for i in range(roi_resized.size(0)):
+        x, y, w, h = (_bbox[i]).int()
+        if w == 0 or h == 0:
+            continue
+        roi_resized[i] = image_transforms.resize(
+            image_transforms.crop(img[i], y, x, h, w), [img.size(-1),img.size(-1)])
+    return roi_resized
+
+
+def img_to_roi(bbox, img, op=0):
+    if op == 0: # no resize
+        return img * bbox
+    return bbox_resize(bbox, img)
 
 
 def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
@@ -261,8 +300,11 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         fg_mask = image_li[3][1]
         fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
 
-        real_pred = netsD[0](real_img * real_bbox)
-        fake_pred = netsD[0](fake_img * fake_bbox)
+        real_roi = img_to_roi(real_bbox, real_img, op=1)
+        fake_roi = img_to_roi(fake_bbox, fake_img, op=1)
+
+        real_pred = netsD[0](real_roi)
+        fake_pred = netsD[0](fake_roi)
         d0_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict["d0"] = d0_loss
@@ -346,7 +388,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
 
         # background rf
         fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
-        fake_pred = netsD[0](fake_img * fake_bbox)
+        fake_roi = img_to_roi(fake_bbox, fake_img, op=1)
+        fake_pred = netsD[0](fake_roi)
         g_bg_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g_bg"] = g_bg_loss
@@ -564,7 +607,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                         range=(-1, 1),
                     )
 
-            if i % 10000 == 0 and i != 0:
+            if i % 40000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
