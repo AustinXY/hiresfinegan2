@@ -15,7 +15,7 @@ from torchvision import transforms, utils, ops
 from tqdm import tqdm
 from torch_utils import image_transforms
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 # try:
 import wandb
@@ -23,7 +23,7 @@ import wandb
 # except ImportError:
 #     wandb = None
 
-from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG
+from model import Generator, Discriminator, Discriminator_BG
 from dataset import MultiResolutionDataset
 from prepare_data import IMIM
 
@@ -123,15 +123,6 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     return path_penalty, path_mean.detach(), path_lengths
 
 
-# def make_noise(batch, latent_dim, n_noise, device):
-#     if n_noise == 1:
-#         return torch.randn(batch, latent_dim, device=device)
-
-#     noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0)
-
-#     return noises
-
-
 def mixing_noise(batch, latent_dim, c, G_mapping, device):
     z = torch.randn(batch, latent_dim, device=device)
     ws = G_mapping(z, c)
@@ -170,57 +161,23 @@ def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
 
 
-def get_bbox_coord(mask, threshold=0.8):
-    bbox_coord = torch.empty(0, 4)
+def mask_to_bbox(mask, threshold=0.8):
+    '''
+    return size: [K, 5]
+    return bbox of form xyxy with batch index as first colum
+    '''
+    bbox = torch.empty(0, 5)
     for i in range(mask.size(0)):
         coord = torch.nonzero(mask[i, 0] >= threshold)
         if coord.size(0) == 0:
-            x1, x2, y1, y2 = (0, -1, 0, -1)
+            x1, x2, y1, y2 = 0, -1, 0, -1
         else:
             x1 = torch.min(coord[:,1]).item()
             x2 = torch.max(coord[:,1]).item()
             y1 = torch.min(coord[:,0]).item()
             y2 = torch.max(coord[:,0]).item()
-        bbox_coord = torch.cat((bbox_coord, torch.tensor([[x1, y1, x2, y2]],dtype=torch.float)))
-    return bbox_coord
-
-
-def mask_to_bbox(mask, threshold=0.8):
-    bbox_coord = get_bbox_coord(mask, threshold)
-    bbox = torch.zeros_like(mask)
-    for i, coord in enumerate(bbox_coord):
-        x1, y1, x2, y2 = coord.int()
-        bbox[i][0][y1: y2+1, x1: x2+1] = 1
-    return bbox
-
-def box_convert(bbox):
-    _bbox = bbox.clone()
-    _bbox[:, 2] = _bbox[:, 2] - _bbox[:, 0]
-    _bbox[:, 3] = _bbox[:, 3] - _bbox[:, 1]
-    return _bbox
-
-def bbox_resize(bbox, img, threshold=0.8):
-    bbox_coord = get_bbox_coord(bbox, threshold)
-    roi_resized = torch.zeros_like(img)
-
-    try:
-        _bbox = ops.box_convert(bbox_coord, in_fmt='xyxy', out_fmt='xywh')
-    except:
-        _bbox = box_convert(bbox_coord)
-
-    for i in range(roi_resized.size(0)):
-        x, y, w, h = (_bbox[i]).int()
-        if w == 0 or h == 0:
-            continue
-        roi_resized[i] = image_transforms.resize(
-            image_transforms.crop(img[i], y, x, h, w), [img.size(-1),img.size(-1)])
-    return roi_resized
-
-
-def img_to_roi(bbox, img, op=0):
-    if op == 0: # no resize
-        return img * bbox
-    return bbox_resize(bbox, img)
+        bbox = torch.cat((bbox, torch.tensor([[i, x1, y1, x2, y2]],dtype=torch.float)))
+    return bbox.to(mask.device)
 
 
 def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
@@ -284,9 +241,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
             print("Done!")
             break
 
-        real_img, real_bbox = next(loader)
+        real_img, real_mask = next(loader)
         real_img = real_img.to(device)
-        real_bbox = real_bbox.to(device)
+        real_mask = real_mask.to(device)
 
         ############# train bg discriminator #############
         generator.requires_grad_(False)
@@ -297,14 +254,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
         image_li = generator(z, b, p, c, mix_style=True)
         fake_img = image_li[0]
-        fg_mask = image_li[3][1]
-        fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
+        fake_mask = image_li[3][1]
 
-        real_roi = img_to_roi(real_bbox, real_img, op=1)
-        fake_roi = img_to_roi(fake_bbox, fake_img, op=1)
+        real_bbox = mask_to_bbox(real_mask, threshold=args.threshold)
+        fake_bbox = mask_to_bbox(fake_mask, threshold=args.threshold)
 
-        real_pred = netsD[0](real_roi)
-        fake_pred = netsD[0](fake_roi)
+        real_pred = netsD[0](real_img, real_bbox)
+        fake_pred = netsD[0](fake_img, fake_bbox)
+
         d0_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict["d0"] = d0_loss
@@ -381,15 +338,14 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         raw_images = image_li[1]
         mkd_images = image_li[2]
         masks = image_li[3]
-        fg_mask = masks[1]
+        fake_mask = masks[1]
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         # background rf
-        fake_bbox = mask_to_bbox(fg_mask, threshold=args.threshold)
-        fake_roi = img_to_roi(fake_bbox, fake_img, op=1)
-        fake_pred = netsD[0](fake_roi)
+        fake_bbox = mask_to_bbox(fake_mask, threshold=args.threshold)
+        fake_pred = netsD[0](fake_img, fake_bbox)
         g_bg_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g_bg"] = g_bg_loss
@@ -558,12 +514,6 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             else:
                                 masks[j] = torch.cat([masks[j], image_li[3][j]])
 
-                        bbox = mask_to_bbox(image_li[3][1], args.threshold)
-                        if bboxes is None:
-                            bboxes = bbox * image_li[0]
-                        else:
-                            bboxes = torch.cat([bboxes, bbox * image_li[0]])
-
                     utils.save_image(
                         fnl_image,
                         f"sample/{str(i).zfill(6)}_0.png",
@@ -599,15 +549,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             range=(0, 1),
                         )
 
-                    utils.save_image(
-                        bboxes,
-                        f"sample/{str(i).zfill(6)}_{str(9)}.png",
-                        nrow=8,
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-
-            if i % 40000 == 0 and i != 0:
+            if i % 30000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -799,20 +741,19 @@ if __name__ == "__main__":
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
 
-    netD0 = Discriminator(
-        c_dim               = 0,                        # Conditioning label (C) dimensionality.
+    netD0 = Discriminator_BG(
         img_resolution      = args.size,                # Input resolution.
         img_channels        = 3,                        # Number of input color channels.
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,                    # Overall multiplier for the number of channels.
         channel_max         = 512,                      # Maximum number of channels in any layer.
-        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
+        num_fp16_res        = 0,                        # Use FP16 for the N highest resolutions.
         conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
+        op                  = 0,                        # roi operation type; 0: roi_pool; 1: roi_align
+        roi_op_out_size     = 8,                        # output size of roi operation
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
-        mapping_kwargs      = {},                       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
-        predict_c           = True,                    # If predict c, then info discriminator, else conditional discriminator.
     ).train().requires_grad_(False).to(device)
 
     netD1 = Discriminator(
