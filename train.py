@@ -15,7 +15,7 @@ from torchvision import transforms, utils, ops
 from tqdm import tqdm
 from torch_utils import image_transforms
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -176,7 +176,7 @@ def mask_to_bbox(mask, threshold=0.8):
             x2 = torch.max(coord[:,1]).item()
             y1 = torch.min(coord[:,0]).item()
             y2 = torch.max(coord[:,0]).item()
-        bbox = torch.cat((bbox, torch.tensor([[i, x1, y1, x2, y2]],dtype=torch.float)))
+        bbox = torch.cat((bbox, torch.tensor([[i, x1, y1, x2, y2]], dtype=torch.float)))
     return bbox.to(mask.device)
 
 

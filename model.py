@@ -855,6 +855,9 @@ class Discriminator_BG(torch.nn.Module):
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
 
+        # resize bbox
+        bbox[:, 1:5] /= x.size(-1)
+
         if self.op == 0:  # roi pool
             x = ops.roi_pool(x, bbox, self.roi_op_out_size)
         else:  # roi align
