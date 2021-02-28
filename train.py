@@ -713,6 +713,9 @@ if __name__ == "__main__":
     args.b_dim = 200
     args.p_dim = 20
     args.c_dim = 200
+    args.op = 1
+    args.roi_op_out_size = 8
+
     args.p_res = None
     if args.p_res is None:
         args.p_res = args.size // 4
@@ -750,8 +753,8 @@ if __name__ == "__main__":
         num_fp16_res        = 0,                        # Use FP16 for the N highest resolutions.
         conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
-        op                  = 0,                        # roi operation type; 0: roi_pool; 1: roi_align
-        roi_op_out_size     = 8,                        # output size of roi operation
+        op                  = args.op,                  # roi operation type; 0: roi_pool; 1: roi_align
+        roi_op_out_size     = args.roi_op_out_size,     # output size of roi operation
         block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
     ).train().requires_grad_(False).to(device)
