@@ -15,7 +15,7 @@ from torchvision import transforms, utils, ops
 from tqdm import tqdm
 from torch_utils import image_transforms
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 # try:
 import wandb
@@ -163,21 +163,40 @@ def binarization_loss(mask):
 
 def mask_to_bbox(mask, threshold=0.8):
     '''
-    return size: [K, 5]
-    return bbox of form xyxy with batch index as first colum
+    return:
+    bbox size: [K, 5]
+    bbox of form xyxy with batch index as first colum
+    bbox_mask: mask off bg
     '''
     bbox = torch.empty(0, 5)
+    bbox_mask = torch.zeros_like(mask)
     for i in range(mask.size(0)):
         coord = torch.nonzero(mask[i, 0] >= threshold)
         if coord.size(0) == 0:
             x1, x2, y1, y2 = 0, -1, 0, -1
         else:
-            x1 = torch.min(coord[:,1]).item()
-            x2 = torch.max(coord[:,1]).item()
-            y1 = torch.min(coord[:,0]).item()
-            y2 = torch.max(coord[:,0]).item()
+            x1 = int(torch.min(coord[:,1]).item())
+            x2 = int(torch.max(coord[:,1]).item())
+            y1 = int(torch.min(coord[:,0]).item())
+            y2 = int(torch.max(coord[:,0]).item())
         bbox = torch.cat((bbox, torch.tensor([[i, x1, y1, x2, y2]], dtype=torch.float)))
-    return bbox.to(mask.device)
+        bbox_mask[i, :, y1:y2+1, x1:x2+1] = 1
+    return bbox.to(mask.device), bbox_mask
+
+
+def clear_mask(mask):
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0])
+        if coord.size(0) == 0:
+            x1, x2, y1, y2 = 0, -1, 0, -1
+        else:
+            x1 = int(torch.min(coord[:,1]).item())
+            x2 = int(torch.max(coord[:,1]).item())
+            y1 = int(torch.min(coord[:,0]).item())
+            y2 = int(torch.max(coord[:,0]).item())
+        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
+    return bbox
 
 
 def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
@@ -244,6 +263,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         real_img, real_mask = next(loader)
         real_img = real_img.to(device)
         real_mask = real_mask.to(device)
+        real_mask = clear_mask(real_mask)
 
         ############# train bg discriminator #############
         generator.requires_grad_(False)
@@ -256,11 +276,11 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         fake_img = image_li[0]
         fake_mask = image_li[3][1]
 
-        real_bbox = mask_to_bbox(real_mask, threshold=args.threshold)
-        fake_bbox = mask_to_bbox(fake_mask, threshold=args.threshold)
+        real_bbox, real_bbox_mask = mask_to_bbox(real_mask, threshold=args.threshold)
+        fake_bbox, fake_bbox_mask = mask_to_bbox(fake_mask, threshold=args.threshold)
 
-        real_pred = netsD[0](real_img, real_bbox)
-        fake_pred = netsD[0](fake_img, fake_bbox)
+        real_pred = netsD[0](real_img * real_bbox_mask, real_bbox)
+        fake_pred = netsD[0](fake_img * fake_bbox_mask, fake_bbox)
 
         d0_loss = d_logistic_loss(real_pred, fake_pred)
 
@@ -344,8 +364,8 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         # background rf
-        fake_bbox = mask_to_bbox(fake_mask, threshold=args.threshold)
-        fake_pred = netsD[0](fake_img, fake_bbox)
+        fake_bbox, fake_bbox_mask = mask_to_bbox(fake_mask, threshold=args.threshold)
+        fake_pred = netsD[0](fake_img * fake_bbox_mask, fake_bbox)
         g_bg_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g_bg"] = g_bg_loss
@@ -713,7 +733,7 @@ if __name__ == "__main__":
     args.b_dim = 200
     args.p_dim = 20
     args.c_dim = 200
-    args.op = 1
+    args.op = 0
     args.roi_op_out_size = 8
 
     args.p_res = None
@@ -896,6 +916,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="stylegan 2 pgan io roi")
+        wandb.init(project="fg-roi-1")
 
     train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device)
