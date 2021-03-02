@@ -811,21 +811,17 @@ class Discriminator_BG(torch.nn.Module):
         num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
         conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
-        op                  = 0,        # roi operation type; 0: roi_pool; 1: roi_align
-        roi_op_out_size     = 7,         # output size of roi operation
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
-        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+        # epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
     ):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
-        self.op = op
-        self.roi_op_out_size = roi_op_out_size
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, int(np.log2(32)), -1)]
 
-        channels_dict = {res: min(
-            channel_base // res, channel_max) for res in self.block_resolutions + [32, roi_op_out_size, roi_op_out_size//2]}
+        channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
+        channels_dict[32] = 1
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
         common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
@@ -840,30 +836,189 @@ class Discriminator_BG(torch.nn.Module):
             setattr(self, f'b{res}', block)
             cur_layer_idx += block.num_layers
 
-        in_channels = channels_dict[roi_op_out_size]
-        tmp_channels = channels_dict[roi_op_out_size]
-        out_channels = channels_dict[roi_op_out_size // 2]
-        common_kwargs['architecture'] = 'orig'
-        self.feat_conv = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=roi_op_out_size,
-                                            first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
-        self.b4 = DiscriminatorEpilogue(channels_dict[roi_op_out_size//2], cmap_dim=0, resolution=roi_op_out_size//2,
-                                        c_dim=0, predict_c=True, **epilogue_kwargs, **common_kwargs)
-
-    def forward(self, img, bbox, **block_kwargs):
+    def forward(self, img, **block_kwargs):
         x = None
         for res in self.block_resolutions:
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
 
-        # resize bbox
-        # bbox[:, 1:5] *= (x.size(-1) / self.img_resolution)
-        bbox[:, 1:5] /= 4
-
-        if self.op == 0:  # roi pool
-            x = ops.roi_pool(x, bbox, self.roi_op_out_size)
-        else:  # roi align
-            x = ops.roi_align(x, bbox, self.roi_op_out_size)
-
-        x, _ = self.feat_conv(x, None, **block_kwargs)
-        x = self.b4(x, None, None)
         return x
+
+#----------------------------------------------------------------------------
+
+class Discriminator_BG_BBOX(torch.nn.Module):
+    def __init__(self,
+        img_resolution,                 # Input resolution.
+        img_channels        = 1,        # Number of input color channels.
+        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+        # channel_base        = 32768,    # Overall multiplier for the number of channels.
+        # channel_max         = 512,      # Maximum number of channels in any layer.
+        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
+        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
+        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
+        # epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.img_channels = img_channels
+        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, int(np.log2(32)), -1)]
+
+        channels_dict = {res: 1 for res in self.block_resolutions}
+        channels_dict[32] = 1
+        fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
+
+        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+        cur_layer_idx = 0
+        for res in self.block_resolutions:
+            in_channels = channels_dict[res] if res < img_resolution else 0
+            tmp_channels = channels_dict[res]
+            out_channels = channels_dict[res // 2]
+            use_fp16 = (res >= fp16_resolution)
+            block = DiscriminatorBlock_BBOX(in_channels, tmp_channels, out_channels, resolution=res,
+                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
+            setattr(self, f'b{res}', block)
+            cur_layer_idx += block.num_layers
+
+    def forward(self, img, **block_kwargs):
+        x = None
+        for res in self.block_resolutions:
+            block = getattr(self, f'b{res}')
+            x, img = block(x, img, **block_kwargs)
+
+        return x
+
+#----------------------------------------------------------------------------
+
+class Conv2dLayer_BBOX(torch.nn.Module):
+    def __init__(self,
+        in_channels,                    # Number of input channels.
+        out_channels,                   # Number of output channels.
+        kernel_size,                    # Width and height of the convolution kernel.
+        bias            = False,        # Apply additive bias before the activation function?
+        activation      = 'linear',     # Activation function: 'relu', 'lrelu', etc.
+        up              = 1,            # Integer upsampling factor.
+        down            = 1,            # Integer downsampling factor.
+        resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
+        conv_clamp      = None,         # Clamp the output to +-X, None = disable clamping.
+        channels_last   = False,        # Expect the input to have memory_format=channels_last?
+        trainable       = False,        # Update the weights of this layer during training?
+    ):
+        super().__init__()
+        self.activation = activation
+        self.up = up
+        self.down = down
+        self.conv_clamp = conv_clamp
+        self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+        self.padding = kernel_size // 2
+        self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
+        self.act_gain = bias_act.activation_funcs[activation].def_gain
+
+        memory_format = torch.channels_last if channels_last else torch.contiguous_format
+        weight = torch.ones([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
+        bias = torch.zeros([out_channels]) if bias else None
+        if trainable:
+            self.weight = torch.nn.Parameter(weight)
+            self.bias = torch.nn.Parameter(bias) if bias is not None else None
+        else:
+            self.register_buffer('weight', weight)
+            if bias is not None:
+                self.register_buffer('bias', bias)
+            else:
+                self.bias = None
+
+    def forward(self, x, gain=1):
+        w = self.weight * self.weight_gain
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        flip_weight = (self.up == 1) # slightly faster
+        x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
+
+        act_gain = self.act_gain * gain
+        act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
+        x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=act_clamp)
+        return x
+
+
+#----------------------------------------------------------------------------
+
+class DiscriminatorBlock_BBOX(torch.nn.Module):
+    def __init__(self,
+        in_channels,                        # Number of input channels, 0 = first block.
+        tmp_channels,                       # Number of intermediate channels.
+        out_channels,                       # Number of output channels.
+        resolution,                         # Resolution of this block.
+        img_channels,                       # Number of input color channels.
+        first_layer_idx,                    # Index of the first layer.
+        architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
+        activation          = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
+        resample_filter     = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
+        conv_clamp          = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
+        use_fp16            = False,        # Use FP16 for this block?
+        fp16_channels_last  = False,        # Use channels-last memory format with FP16?
+        freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
+    ):
+        assert in_channels in [0, tmp_channels]
+        assert architecture in ['orig', 'skip', 'resnet']
+        super().__init__()
+        self.in_channels = in_channels
+        self.resolution = resolution
+        self.img_channels = img_channels
+        self.first_layer_idx = first_layer_idx
+        self.architecture = architecture
+        self.use_fp16 = use_fp16
+        self.channels_last = (use_fp16 and fp16_channels_last)
+        self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+
+        self.num_layers = 0
+        def trainable_gen():
+            while True:
+                layer_idx = self.first_layer_idx + self.num_layers
+                trainable = (layer_idx >= freeze_layers)
+                self.num_layers += 1
+                yield trainable
+        trainable_iter = trainable_gen()
+
+        if in_channels == 0 or architecture == 'skip':
+            self.fromrgb = Conv2dLayer_BBOX(img_channels, tmp_channels, kernel_size=1, activation=activation,
+                trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
+
+        self.conv0 = Conv2dLayer_BBOX(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
+            trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
+
+        self.conv1 = Conv2dLayer_BBOX(tmp_channels, out_channels, kernel_size=3, activation=activation, down=2,
+            trainable=next(trainable_iter), resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last)
+
+        if architecture == 'resnet':
+            self.skip = Conv2dLayer_BBOX(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
+                trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
+
+    def forward(self, x, img, force_fp32=False):
+        dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
+        memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
+
+        # Input.
+        if x is not None:
+            misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
+            x = x.to(dtype=dtype, memory_format=memory_format)
+
+        # FromRGB.
+        if self.in_channels == 0 or self.architecture == 'skip':
+            misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+            img = img.to(dtype=dtype, memory_format=memory_format)
+            y = self.fromrgb(img)
+            x = x + y if x is not None else y
+            img = upfirdn2d.downsample2d(img, self.resample_filter) if self.architecture == 'skip' else None
+
+        # Main layers.
+        if self.architecture == 'resnet':
+            y = self.skip(x, gain=np.sqrt(0.5))
+            x = self.conv0(x)
+            x = self.conv1(x, gain=np.sqrt(0.5))
+            x = y.add_(x)
+        else:
+            x = self.conv0(x)
+            x = self.conv1(x)
+
+        assert x.dtype == dtype
+        return x, img
