@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -167,6 +167,41 @@ def sample_codes(batch, latent_dim, b_dim, p_dim, c_dim, device):
 def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
 
+def clear_mask(mask):
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0])
+        if coord.size(0) == 0:
+            x1, x2, y1, y2 = 0, -1, 0, -1
+        else:
+            x1 = int(torch.min(coord[:,1]).item())
+            x2 = int(torch.max(coord[:,1]).item())
+            y1 = int(torch.min(coord[:,0]).item())
+            y2 = int(torch.max(coord[:,0]).item())
+        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
+    return bbox
+
+
+def pad_mask(mask, pad_width=1):
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0])
+        if coord.size(0) == 0:
+            x1, x2, y1, y2 = 0, -1, 0, -1
+        else:
+            x1 = int(torch.min(coord[:,1]).item())
+            x2 = int(torch.max(coord[:,1]).item())
+            y1 = int(torch.min(coord[:,0]).item())
+            y2 = int(torch.max(coord[:,0]).item())
+
+        x1 = max(x1-pad_width, 0)
+        x2 = min(x2+pad_width, mask.size(-1))
+        y1 = max(y1-pad_width, 0)
+        y2 = min(y2+pad_width, mask.size(-1))
+        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
+    return bbox
+
+
 def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, device):
     loader = sample_data(loader)
 
@@ -233,6 +268,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         real_img, mask = next(loader)
         real_img = real_img.to(device)
         mask = mask.to(device)
+        mask = clear_mask(mask)
 
         ############# train bg discriminator #############
         generator.requires_grad_(False)
@@ -249,9 +285,9 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
         fnl_masks = netsD[3](mask)
         fake_pred = netsD[0](fake_bg)
 
-        weights_real = torch.ones_like(real_pred)
-        invalid_patch = fnl_masks != 0.0
-        weights_real.masked_fill_(invalid_patch, 0.0)
+        fnl_masks = pad_mask(fnl_masks, args.pad_width)
+
+        weights_real = torch.ones_like(fnl_masks) - fnl_masks
 
         real_loss = F.softplus(-real_pred)
         real_loss = (torch.sum(real_loss * weights_real) / torch.sum(weights_real)) * args.bg_wt
@@ -542,7 +578,7 @@ def train(args, loader, generator, netsD, g_optim, rf_opt, info_opt, g_ema, devi
                             range=(0, 1),
                         )
 
-            if i % 10000 == 0 and i != 0:
+            if i % 20000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -698,7 +734,10 @@ if __name__ == "__main__":
     args.r1_gamma = spec.gamma
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
-    args.bg_wt = 3
+
+    # bg discr param
+    args.bg_wt = 1
+    args.pad_width = 1
 
     args.start_iter = 0
 

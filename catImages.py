@@ -2,7 +2,7 @@ from PIL import Image
 import os
 
 
-count = 211000
+count = 36000
 
 
 def get_concat_v(im1, im2):
