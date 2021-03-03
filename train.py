@@ -737,7 +737,7 @@ if __name__ == "__main__":
 
     # bg discr param
     args.bg_wt = 1
-    args.pad_width = 1
+    args.pad_width = 0
 
     args.start_iter = 0
 
