@@ -1,3 +1,4 @@
+from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG, UNet
 import argparse
 import math
 import random
@@ -14,7 +15,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # try:
 import wandb
@@ -22,7 +23,6 @@ import wandb
 # except ImportError:
 #     wandb = None
 
-from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG, Unet
 from dataset import MultiResolutionDataset
 from prepare_data import IMIM
 
@@ -336,6 +336,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         ############# train mask to bbox net #############
         generator.requires_grad_(False)
         mask2bbox.requires_grad_(True)
+        netsD[0].requires_grad_(False)
         netsD[1].requires_grad_(False)
         netsD[2].requires_grad_(False)
 
@@ -353,20 +354,41 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         construction_loss.backward()
         m2b_optim.step()
 
-
-        ############# train child discriminator #############
+        ############# train bg discriminator #############
         generator.requires_grad_(False)
         mask2bbox.requires_grad_(False)
+        netsD[0].requires_grad_(True)
         netsD[1].requires_grad_(False)
-        netsD[2].requires_grad_(True)
+        netsD[2].requires_grad_(False)
 
         fake_img = image_li[0]
         fake_mask = image_li[3][1]
         fake_bbox = mask2bbox(fake_mask)
         fake_pair = torch.cat((fake_img, fake_bbox), dim=1)
 
-        real_pred = netsD[2](real_pair)[0]
-        fake_pred = netsD[2](fake_pair)[0]
+        real_pred = netsD[0](real_pair)[0]
+        fake_pred = netsD[0](fake_pair)[0]
+
+        d0_loss = d_logistic_loss(real_pred, fake_pred)
+
+        loss_dict["d0"] = d0_loss
+
+        netsD[0].zero_grad()
+        d0_loss.backward()
+        rf_opt[0].step()
+
+        ############# train child discriminator #############
+        generator.requires_grad_(False)
+        mask2bbox.requires_grad_(False)
+        netsD[0].requires_grad_(False)
+        netsD[1].requires_grad_(False)
+        netsD[2].requires_grad_(True)
+        z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
+        image_li = generator(z, b, p, c, mix_style=True)
+        fake_img = image_li[0]
+
+        real_pred = netsD[2](real_img)[0]
+        fake_pred = netsD[2](fake_img)[0]
 
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
@@ -385,7 +407,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         d_regularize = i % args.d_reg_every == 0
 
         if d_regularize:
-            real_pair.requires_grad = True
+            real_img.requires_grad = True
 
             # if args.augment:
             #     real_img_aug, _ = augment(real_img_tmp, ada_aug_p)
@@ -393,8 +415,8 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
             # else:
             #     real_img_aug = real_img_tmp
 
-            real_pred = netsD[2](real_pair)[0]
-            r1_penalty = d_r1_loss(real_pred, real_pair)
+            real_pred = netsD[2](real_img)[0]
+            r1_penalty = d_r1_loss(real_pred, real_img)
             r1_loss = r1_penalty.mean() * (args.r1_gamma / 2)
 
             netsD[2].zero_grad()
@@ -409,6 +431,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         #----------------------------------------------------------------------------
         generator.requires_grad_(True)
         mask2bbox.requires_grad_(False)
+        netsD[0].requires_grad_(False)
         netsD[1].requires_grad_(True)
         netsD[2].requires_grad_(True)
 
@@ -425,8 +448,14 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         # if args.augment:
         #     fake_img, _ = augment(fake_img, ada_aug_p)
 
+        # bg rf
+        fake_pred = netsD[0](fake_pair)[0]
+        g0_loss = g_nonsaturating_loss(fake_pred)
+
+        loss_dict["g0"] = g0_loss
+
         # child rf
-        fake_pred = netsD[2](fake_pair)[0]
+        fake_pred = netsD[2](fake_img)[0]
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
@@ -435,8 +464,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         pred_p = netsD[1](mkd_images[1])[1]
         p_info_loss = criterion_class(pred_p, torch.nonzero(p.long(), as_tuple=False)[:,1])
 
-        mkd_c_pair = torch.cat((mkd_images[2], fake_bbox), dim=1)
-        pred_c = netsD[2](mkd_c_pair)[1]
+        pred_c = netsD[2](mkd_images[2])[1]
         c_info_loss = criterion_class(pred_c, torch.nonzero(c.long(), as_tuple=False)[:,1])
 
         loss_dict["p_info"] = p_info_loss
@@ -454,7 +482,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g0_loss, g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
@@ -472,20 +500,16 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
             ws = generator.style_mixing(z, b, p, c)
             image_li = generator.generate(ws)
             fake_img = image_li[0]
-            fake_mask = image_li[3][1]
-
-            fake_bbox = mask2bbox(fake_mask)
-            fake_pair = torch.cat((fake_img, fake_bbox), dim=1)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
-                fake_pair, ws, mean_path_length
+                fake_img, ws, mean_path_length
             )
 
             generator.zero_grad()
             weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
 
             if args.path_batch_shrink:
-                weighted_path_loss += 0 * fake_pair[0, 0, 0, 0]
+                weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
 
             weighted_path_loss.backward()
 
@@ -514,7 +538,9 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
 
         loss_reduced = reduce_loss_dict(loss_dict)
 
+        d0_loss_val = loss_reduced["d0"].mean().item()
         d_loss_val = loss_reduced["d"].mean().item()
+        g0_loss_val = loss_reduced["g0"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
         m2b_loss_val = loss_reduced["m2b"].mean().item()
         p_info_loss_val = loss_reduced["p_info"].mean().item()
@@ -530,7 +556,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; m2b: {m2b_loss_val: .4f}; "
+                    f"d: {d0_loss_val:.4f}; g: {g0_loss_val:.4f}; d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; m2b: {m2b_loss_val: .4f}; "
                     f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
                     f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; r1: {r1_val:.4f}; "
@@ -541,6 +567,8 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
             if wandb and args.wandb:
                 wandb.log(
                     {
+                        "BG_Generator": g0_loss_val,
+                        "BG_Discriminator": d0_loss_val,
                         "Generator": g_loss_val,
                         "Discriminator": d_loss_val,
                         "p_info": p_info_loss_val,
@@ -643,6 +671,8 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
                 torch.save(
                     {
                         "g": g_module.state_dict(),
+                        "m2b": m2b_module.state_dict(),
+                        "d0": d_module0.state_dict(),
                         "d1": d_module1.state_dict(),
                         "d2": d_module2.state_dict(),
                         "g_ema": g_ema.state_dict(),
@@ -830,11 +860,26 @@ if __name__ == "__main__":
     g_ema.eval()
     # accumulate(g_ema, generator, 0)
 
-    mask2bbox = Unet(
-        in_c = 1,
-        out_c = 1,
+    mask2bbox = UNet(
+        n_channels = 1,
+        n_classes = 1,
+        bilinear = True,
     ).train().requires_grad_(False).to(device)
 
+    netD0 = Discriminator(
+        c_dim               = 0,                        # Conditioning label (C) dimensionality.
+        img_resolution      = args.size,                # Input resolution.
+        img_channels        = 4,                        # Number of input color channels.
+        architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
+        channel_base        = 32768,                    # Overall multiplier for the number of channels.
+        channel_max         = 512,                      # Maximum number of channels in any layer.
+        num_fp16_res        = 4,                        # Use FP16 for the N highest resolutions.
+        conv_clamp          = 256,                      # Clamp the output of convolution layers to +-X, None = disable clamping.
+        cmap_dim            = None,                     # Dimensionality of mapped conditioning label, None = default.
+        block_kwargs        = {},                       # Arguments for DiscriminatorBlock.
+        mapping_kwargs      = {},                       # Arguments for MappingNetwork.
+        epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
+    ).train().requires_grad_(False).to(device)
     netD1 = Discriminator(
         c_dim               = args.p_dim,               # Conditioning label (C) dimensionality.
         img_resolution      = args.p_res,               # Input resolution.
@@ -853,7 +898,7 @@ if __name__ == "__main__":
     netD2 = Discriminator(
         c_dim               = args.c_dim,               # Conditioning label (C) dimensionality.
         img_resolution      = args.size,                # Input resolution.
-        img_channels        = args.img_dim,             # Number of input color channels.
+        img_channels        = 3,                        # Number of input color channels.
         architecture        = 'resnet',                 # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,                    # Overall multiplier for the number of channels.
         channel_max         = 512,                      # Maximum number of channels in any layer.
@@ -864,7 +909,7 @@ if __name__ == "__main__":
         mapping_kwargs      = {},                       # Arguments for MappingNetwork.
         epilogue_kwargs     = {'mbstd_group_size': 4},  # Arguments for DiscriminatorEpilogue.
     ).train().requires_grad_(False).to(device)
-    netsD = [None, netD1, netD2]
+    netsD = [netD0, netD1, netD2]
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -883,12 +928,17 @@ if __name__ == "__main__":
         betas=(0, 0.99),
     )
 
+    rf_optim0 = optim.Adam(
+        netsD[0].parameters(),
+        lr=args.lr * d_reg_ratio,
+        betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
+    )
     rf_optim2 = optim.Adam(
         netsD[2].parameters(),
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
-    rf_opt = [None, None, rf_optim2]
+    rf_opt = [rf_optim0, None, rf_optim2]
 
     info_optim1 = optim.Adam(
         netsD[1].parameters(),
