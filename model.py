@@ -1125,3 +1125,117 @@ class DiscriminatorBlock_BBOX(torch.nn.Module):
 
         assert x.dtype == dtype
         return x, img
+
+#----------------------------------------------------------------------------
+
+class GLU(nn.Module):
+    def __init__(self):
+        super(GLU, self).__init__()
+
+    def forward(self, x):
+        nc = x.size(1)
+        assert nc % 2 == 0, 'channels dont divide 2!'
+        nc = int(nc/2)
+        return x[:, :nc] * torch.sigmoid(x[:, nc:])
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channel_num):
+        super(ResBlock, self).__init__()
+        self.block = nn.Sequential(
+            conv3x3(channel_num, channel_num * 2),
+            nn.BatchNorm2d(channel_num * 2),
+            GLU(),
+            conv3x3(channel_num, channel_num),
+            nn.BatchNorm2d(channel_num)
+        )
+
+    def forward(self, x):
+        residual = x
+        out = self.block(x)
+        out += residual
+        return out
+
+def sameBlock(in_planes, out_planes):
+    block = nn.Sequential(
+        conv3x3(in_planes, out_planes * 2),
+        nn.BatchNorm2d(out_planes * 2),
+        GLU()
+    )
+    return block
+
+def conv3x3(in_planes, out_planes):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=1,
+                     padding=1, bias=False)
+
+# mask predict
+def Up_unet(in_c, out_c):
+    return nn.Sequential(nn.ConvTranspose2d(in_c, out_c*2, 4, 2, 1), nn.BatchNorm2d(out_c*2), GLU())
+
+
+# def BottleNeck(in_c, out_c):
+#     return nn.Sequential(nn.Conv2d(in_c, out_c*2, 4, 4), nn.BatchNorm2d(out_c*2), GLU())
+
+
+def Down_unet(in_c, out_c):
+    return nn.Sequential(nn.Conv2d(in_c, out_c*2, 4, 2, 1), nn.BatchNorm2d(out_c*2), GLU())
+
+
+class Unet(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+
+        self.first = nn.Sequential(sameBlock(in_c, 32), sameBlock(32, 32))
+
+        self.down1 = Down_unet(32, 32)
+        # 32*64*64
+        self.down2 = Down_unet(32, 64)
+        # 64*32*32
+        self.down3 = Down_unet(64, 128)
+        # 128*16*16
+        self.down4 = Down_unet(128, 256)
+        # 256*8*8
+        self.down5 = Down_unet(256, 512)
+        # 512*4*4
+        self.down6 = Down_unet(512, 512)
+        # 512*2*2
+
+        self.up1 = Up_unet(512, 256)
+        # 256*4*4
+        self.up2 = Up_unet(256+512, 512)
+        # 256*8*8
+        self.up3 = Up_unet(512+256, 256)
+        # 256*16*16
+        self.up4 = Up_unet(256+128, 128)
+        # 128*32*32
+        self.up5 = Up_unet(128+64, 64)
+        # 64*64*64
+        self.up6 = Up_unet(64+32, out_c)
+        # out_c*128*128
+
+        self.last = nn.Sequential(
+            ResBlock(out_c),
+            # ResBlock(out_c),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+
+        x = self.first(x)
+
+        x1 = self.down1(x)
+        x2 = self.down2(x1)
+        x3 = self.down3(x2)
+        x4 = self.down4(x3)
+        x5 = self.down5(x4)
+
+        x = self.up1(self.down6(x5))
+
+        x = self.up2(torch.cat([x, x5], dim=1))
+        x = self.up3(torch.cat([x, x4], dim=1))
+        x = self.up4(torch.cat([x, x3], dim=1))
+        x = self.up5(torch.cat([x, x2], dim=1))
+        x = self.up6(torch.cat([x, x1], dim=1))
+
+        return self.last(x)
