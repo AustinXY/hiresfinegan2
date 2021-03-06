@@ -482,7 +482,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         loss_dict["bin"] = binary_loss
         loss_dict["cvg"] = fg_cvg_loss + bg_cvg_loss
 
-        generator_loss = g0_loss, g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
+        generator_loss = g0_loss + g_loss + p_info_loss + c_info_loss + binary_loss + fg_cvg_loss + bg_cvg_loss
 
         generator.zero_grad()
         netsD[1].zero_grad()
