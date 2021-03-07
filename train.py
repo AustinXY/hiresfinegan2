@@ -1,4 +1,3 @@
-from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG, UNet
 import argparse
 import math
 import random
@@ -16,6 +15,8 @@ from torchvision import transforms, utils
 from tqdm import tqdm
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
+
+from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG, UNet
 
 # try:
 import wandb
@@ -336,7 +337,6 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         ############# train mask to bbox net #############
         generator.requires_grad_(False)
         mask2bbox.requires_grad_(True)
-        netsD[0].requires_grad_(False)
         netsD[1].requires_grad_(False)
         netsD[2].requires_grad_(False)
 
@@ -345,14 +345,20 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         fake_mask = image_li[3][1]
 
         fake_bbox = mask2bbox(fake_mask)
-        target_bbox = mask_to_bbox(fake_mask)
-        construction_loss = criterion_construct(fake_bbox, target_bbox)
+        fake_target_bbox = mask_to_bbox(fake_mask, args.threshold)
+        fake_construction_loss = criterion_construct(fake_bbox, fake_target_bbox)
 
+        real_bbox = mask2bbox(real_mask)
+        real_target_bbox = mask_to_bbox(real_mask, args.threshold)
+        real_construction_loss = criterion_construct(real_bbox, real_target_bbox)
+
+        construction_loss = fake_construction_loss + real_construction_loss * 1e-1
         loss_dict["m2b"] = construction_loss
 
         m2b_optim.zero_grad()
         construction_loss.backward()
         m2b_optim.step()
+
 
         ############# train bg discriminator #############
         generator.requires_grad_(False)
@@ -556,7 +562,7 @@ def train(args, loader, generator, mask2bbox, netsD, g_optim, m2b_optim, rf_opt,
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d0_loss_val:.4f}; g: {g0_loss_val:.4f}; d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; m2b: {m2b_loss_val: .4f}; "
+                    f"d0: {d0_loss_val:.4f}; g0: {g0_loss_val:.4f}; d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; m2b: {m2b_loss_val: .4f}; "
                     f"p_info: {p_info_loss_val:.4f}; c_info: {c_info_loss_val:.4f}; "
                     f"bin: {binary_loss_val:.4f}; cvg: {cvg_loss_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; r1: {r1_val:.4f}; "
