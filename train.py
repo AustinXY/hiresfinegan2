@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 
 from model import Generator, Discriminator, Discriminator_BG_BBOX, Discriminator_BG, UNet
 
@@ -168,19 +168,7 @@ def sample_codes(batch, latent_dim, b_dim, p_dim, c_dim, device):
 def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
 
-def clear_mask(mask):
-    bbox = torch.zeros_like(mask)
-    for i in range(mask.size(0)):
-        coord = torch.nonzero(mask[i, 0])
-        if coord.size(0) == 0:
-            x1, x2, y1, y2 = 0, -1, 0, -1
-        else:
-            x1 = int(torch.min(coord[:,1]).item())
-            x2 = int(torch.max(coord[:,1]).item())
-            y1 = int(torch.min(coord[:,0]).item())
-            y2 = int(torch.max(coord[:,0]).item())
-        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
-    return bbox
+
 
 # class MASK_TO_BBOX(torch.autograd.Function):
 #     @staticmethod
@@ -221,24 +209,6 @@ def clear_mask(mask):
 #             grad_input[i, 0, b[0], b[1]] += grad_output[i, 0, b[0], b[1]]
 #         return grad_input, None
 
-def mask_to_bbox(mask, threshold=0.8):
-    '''
-    output bbox value range [0, 1]
-    '''
-    bbox = torch.zeros_like(mask)
-    for i in range(mask.size(0)):
-        coord = torch.nonzero(mask[i, 0] >= threshold)
-        if coord.size(0) == 0:
-            x1, x2, y1, y2 = 0, 0, 0, 0
-        else:
-            x1 = int(torch.min(coord[:,1]).item())
-            x2 = int(torch.max(coord[:,1]).item())
-            y1 = int(torch.min(coord[:,0]).item())
-            y2 = int(torch.max(coord[:,0]).item())
-        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
-    return bbox
-
-
 # def pad_mask(mask, pad_width=1):
 #     bbox = torch.zeros_like(mask)
 #     for i in range(mask.size(0)):
@@ -257,6 +227,95 @@ def mask_to_bbox(mask, threshold=0.8):
 #         y2 = min(y2+pad_width, mask.size(-1))
 #         bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
 #     return bbox
+
+def clear_mask(mask):
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0])
+        if coord.size(0) == 0:
+            x1, x2, y1, y2 = 0, -1, 0, -1
+        else:
+            x1 = int(torch.min(coord[:, 1]).item())
+            x2 = int(torch.max(coord[:, 1]).item())
+            y1 = int(torch.min(coord[:, 0]).item())
+            y2 = int(torch.max(coord[:, 0]).item())
+        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
+    return bbox
+
+def mask_to_bbox(mask, threshold=0.8):
+    '''
+    output bbox value range [0, 1]
+    '''
+    bbox = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0] >= threshold)
+        if coord.size(0) == 0:
+            x1, x2, y1, y2 = 0, 0, 0, 0
+        else:
+            x1 = int(torch.min(coord[:,1]).item())
+            x2 = int(torch.max(coord[:,1]).item())
+            y1 = int(torch.min(coord[:,0]).item())
+            y2 = int(torch.max(coord[:,0]).item())
+        bbox[i, :, y1:y2+1, x1:x2+1] = 1.0
+    return bbox
+
+def randomly_shrink_mask(mask):
+    rslt_mask = torch.zeros_like(mask)
+    for i in range(mask.size(0)):
+        coord = torch.nonzero(mask[i, 0])
+
+        x1 = int(torch.min(coord[:,1]).item())
+        x2 = int(torch.max(coord[:,1]).item())
+        w = x2 - x1
+        y1 = int(torch.min(coord[:,0]).item())
+        y2 = int(torch.max(coord[:,0]).item())
+        h = y2 - y1
+
+        _x1 = random.randint(x1, x1+w//2)
+        _w = random.randint(w//2, w)
+        _x2 = _x1 + _w
+
+        _y1 = random.randint(y1, y1+h//2)
+        _h = random.randint(h//2, h)
+        _y2 = _y1 + _h
+
+        rslt_mask[i, :, _y1: _y2+1, _x1: _x2+1] = 1.0
+    return rslt_mask * mask
+
+def create_testing_image1(real_image):
+    '''
+    break real image into four pieces
+    '''
+    dim = real_image.size(-1)
+    test_image = torch.zeros_like(real_image)
+    test_image[:, :, 0: dim//2, 0: dim//2] = real_image[:, :, dim//2: dim, dim//2: dim]
+    test_image[:, :, dim//2: dim, dim//2: dim] = real_image[:, :, 0: dim//2, 0: dim//2]
+    test_image[:, :, 0: dim//2, dim//2: dim] = real_image[:, :, dim//2: dim, 0: dim//2]
+    test_image[:, :, dim//2: dim, 0: dim//2] = real_image[:, :, 0: dim//2, dim//2: dim]
+    return test_image
+
+
+def create_testing_image3(real_image):
+    '''
+    break real image into 2 pieces
+    '''
+    dim = real_image.size(-1)
+    test_image = torch.zeros_like(real_image)
+    test_image[:, :, 0: dim, 0: dim//2] = real_image[:, :, 0: dim, dim//2: dim]
+    test_image[:, :, 0: dim, dim//2: dim] = real_image[:, :, 0: dim, 0: dim//2]
+    return test_image
+
+
+def create_testing_image2(real_image, real_mask, bg_image):
+    '''
+    paste some real_image patch onto bg_image
+    '''
+    dim = real_image.size(-1)
+    test_image = bg_image.clone()
+    patch_mask = randomly_shrink_mask(real_mask)
+    test_image = patch_mask * real_image
+    test_image += bg_image * (torch.ones_like(patch_mask) - patch_mask)
+    return test_image
 
 
 def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info_opt, g_ema, device):
@@ -330,7 +389,7 @@ def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info
         real_img, real_mask = next(loader)
         real_img = real_img.to(device)
         real_mask = real_mask.to(device)
-
+        real_mask = clear_mask(real_mask)
         # real_bbox = mask_to_bbox(real_mask, args.threshold)
         # real_pair = torch.cat((real_img, real_bbox), dim=1)
 
@@ -343,11 +402,130 @@ def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info
 
         z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
         image_li = generator(z, b, p, c, mix_style=True)
+
+
+        ####################################################
+        ## testing
+        fake_image = image_li[0]
+        utils.save_image(
+            fake_image,
+            f"test/fake_img.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        fake_mask = image_li[3][1]
+        utils.save_image(
+            fake_mask,
+            f"test/fake_mk.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+        fake_bx = unets[1](fake_image)
+        utils.save_image(
+            fake_bx,
+            f"test/fake_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        bg_image = image_li[1][0]
+        bg_bx = unets[1](bg_image)
+        utils.save_image(
+            bg_image,
+            f"test/bg.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        utils.save_image(
+            bg_bx,
+            f"test/bg_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        real_bx = unets[1](real_img)
+        utils.save_image(
+            real_img,
+            f"test/real.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        utils.save_image(
+            real_bx,
+            f"test/real_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        test_image1 = create_testing_image1(real_img)
+        test1_bx = unets[1](test_image1)
+        utils.save_image(
+            test_image1,
+            f"test/test1.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        utils.save_image(
+            test1_bx,
+            f"test/test1_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        test_image3 = create_testing_image3(real_img)
+        test3_bx = unets[1](test_image3)
+        utils.save_image(
+            test_image3,
+            f"test/test3.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        utils.save_image(
+            test3_bx,
+            f"test/test3_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        test_image2 = create_testing_image2(real_img, real_mask, bg_image)
+        test2_bx = unets[1](test_image2)
+        utils.save_image(
+            test_image2,
+            f"test/test2.png",
+            nrow=8,
+            normalize=True,
+            range=(-1, 1),
+        )
+        utils.save_image(
+            test2_bx,
+            f"test/test2_bx.png",
+            nrow=8,
+            normalize=True,
+            range=(0, 1),
+        )
+
+        sys
+
+        ####################################################
+
+
         fake_mask = image_li[3][1]
 
         fake_m2b = unets[0](fake_mask)
+
         fake_target_bbox = mask_to_bbox(fake_mask, args.threshold)
-        construction_loss = criterion_construct(fake_m2b, fake_target_bbox)
+        construction_loss = criterion_construct(fake_m2b, fake_target_bbox) * 5
 
         # real_bbox = mask2bbox(real_mask)
         # real_target_bbox = mask_to_bbox(real_mask, args.threshold)
@@ -369,8 +547,9 @@ def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info
         netsD[2].requires_grad_(False)
 
         real_i2b = unets[1](real_img)
+
         real_target_bbox = mask_to_bbox(real_mask, args.threshold)
-        prediction_loss = criterion_construct(real_i2b, real_target_bbox)
+        prediction_loss = criterion_construct(real_i2b, real_target_bbox) * 5
 
         # real_bbox = mask2bbox(real_mask)
         # real_target_bbox = mask_to_bbox(real_mask, args.threshold)
@@ -454,7 +633,7 @@ def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info
         # mask matching
         fake_m2b = unets[0](fake_mask)
         fake_i2b = unets[1](fake_img)
-        g_mk_loss = criterion_construct(fake_i2b, fake_m2b)
+        g_mk_loss = criterion_construct(fake_i2b, fake_m2b) * 30
 
         loss_dict["g_mk"] = g_mk_loss
 
@@ -671,7 +850,7 @@ def train(args, loader, generator, unets, netsD, g_optim, unet_opt, rf_opt, info
                         range=(0, 1),
                     )
 
-            if i % 10000 == 0 and i != 0:
+            if i % 20000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -962,7 +1141,8 @@ if __name__ == "__main__":
             pass
 
         generator.load_state_dict(ckpt["g"])
-        mask2bbox.load_state_dict(ckpt["m2b"])
+        unets[0].load_state_dict(ckpt["i2b"])
+        unets[1].load_state_dict(ckpt["m2b"])
         netsD[1].load_state_dict(ckpt["d1"])
         netsD[2].load_state_dict(ckpt["d2"])
         g_ema.load_state_dict(ckpt["g_ema"])
