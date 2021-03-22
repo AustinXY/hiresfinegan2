@@ -302,7 +302,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         # resized_style_img = image_transforms.resize(
         #     style_img, [fine_img.size(-1), fine_img.size(-1)])
         resized_style_img = style_img
-        fine_loss = criterion_construct(fine_img, resized_style_img)
+        fine_loss = criterion_construct(fine_img, resized_style_img) * args.fine_wt
 
         loss_dict["fine"] = fine_loss
 
@@ -592,6 +592,7 @@ if __name__ == "__main__":
     args.c_dim = 200
 
     args.fine_model = '../data/fine_model/fine_models.pt'
+    args.fine_wt = 0
 
     if args.batch == 0:
         args.batch = spec.mb
@@ -604,6 +605,7 @@ if __name__ == "__main__":
         img_resolution      = args.size,                # Output resolution.
         img_channels        = 3,                        # Number of output color channels.
         mapping_kwargs      = {},        # Arguments for MappingNetwork.
+        condition_const     = False,
         synthesis_kwargs    = {'channel_base': 32768,
                                'channel_max': 512,
                                'num_fp16_res': 4,

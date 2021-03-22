@@ -396,6 +396,7 @@ class SynthesisBlock(torch.nn.Module):
         conv_clamp          = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
         use_fp16            = False,        # Use FP16 for this block?
         fp16_channels_last  = False,        # Use channels-last memory format with FP16?
+        condition_const     = False,
         **layer_kwargs,                     # Arguments for SynthesisLayer.
     ):
         assert architecture in ['orig', 'skip', 'resnet']
@@ -411,9 +412,13 @@ class SynthesisBlock(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
         self.num_conv = 0
         self.num_torgb = 0
+        self.condition_const = condition_const
 
         if in_channels == 0:
-            self.const = torch.nn.Parameter(torch.randn([out_channels, resolution, resolution]))
+            if not condition_const:
+                self.const = torch.nn.Parameter(torch.randn([out_channels, resolution, resolution]))
+            else:
+                self.const_mapping = ConstMappingNetwork(img_channels, out_channels)
 
         if in_channels != 0:
             self.conv0 = SynthesisLayer(in_channels, out_channels, w_dim=w_dim, resolution=resolution, up=2,
@@ -444,8 +449,11 @@ class SynthesisBlock(torch.nn.Module):
 
         # Input.
         if self.in_channels == 0:
-            x = self.const.to(dtype=dtype, memory_format=memory_format)
-            x = x.unsqueeze(0).repeat([ws.shape[0], 1, 1, 1])
+            if not self.condition_const:
+                x = self.const.to(dtype=dtype, memory_format=memory_format)
+                x = x.unsqueeze(0).repeat([ws.shape[0], 1, 1, 1])
+            else:
+                x = self.const_mapping(x)
         else:
             misc.assert_shape(x, [None, self.in_channels, self.resolution // 2, self.resolution // 2])
             x = x.to(dtype=dtype, memory_format=memory_format)
@@ -453,6 +461,7 @@ class SynthesisBlock(torch.nn.Module):
         # Main layers.
         if self.in_channels == 0:
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+
         elif self.architecture == 'resnet':
             y = self.skip(x, gain=np.sqrt(0.5))
             x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
@@ -485,6 +494,7 @@ class SynthesisNetwork(torch.nn.Module):
         channel_base    = 32768,    # Overall multiplier for the number of channels.
         channel_max     = 512,      # Maximum number of channels in any layer.
         num_fp16_res    = 0,        # Use FP16 for the N highest resolutions.
+        condition_const = False,
         **block_kwargs,             # Arguments for SynthesisBlock.
     ):
         assert img_resolution >= 4 and img_resolution & (img_resolution - 1) == 0
@@ -493,6 +503,7 @@ class SynthesisNetwork(torch.nn.Module):
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
+        self.condition_const = condition_const
         self.block_resolutions = [2 ** i for i in range(2, self.img_resolution_log2 + 1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
@@ -504,13 +515,13 @@ class SynthesisNetwork(torch.nn.Module):
             use_fp16 = (res >= fp16_resolution)
             is_last = (res == self.img_resolution)
             block = SynthesisBlock(in_channels, out_channels, w_dim=w_dim, resolution=res,
-                img_channels=img_channels, is_last=is_last, use_fp16=use_fp16, **block_kwargs)
+                                   img_channels=img_channels, is_last=is_last, use_fp16=use_fp16, condition_const=condition_const, **block_kwargs)
             self.num_ws += block.num_conv
             if is_last:
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, **block_kwargs):
+    def forward(self, ws, fine_img=None, **block_kwargs):
         block_ws = []
         with torch.autograd.profiler.record_function('split_ws'):
             misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
@@ -522,6 +533,10 @@ class SynthesisNetwork(torch.nn.Module):
                 w_idx += block.num_conv
 
         x = img = None
+        if self.condition_const:
+            assert fine_img is not None
+            x = fine_img
+
         skip_li = []
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
@@ -533,20 +548,22 @@ class SynthesisNetwork(torch.nn.Module):
 
 class Generator(torch.nn.Module):
     def __init__(self,
-        w_dim,                      # Intermediate latent (W) dimensionality.
-        img_resolution,             # Output resolution.
-        img_channels,               # Number of output color channels.
-        mapping_kwargs      = {},   # Arguments for MappingNetwork.
-        synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
-        mix_prob = 0.9,
-        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+        w_dim,                        # Intermediate latent (W) dimensionality.
+        img_resolution,               # Output resolution.
+        img_channels,                 # Number of output color channels.
+        mapping_kwargs      = {},     # Arguments for MappingNetwork.
+        synthesis_kwargs    = {},     # Arguments for SynthesisNetwork.
+        mix_prob            = 0.9,
+        condition_const     = False,
+        epilogue_kwargs     = {},     # Arguments for DiscriminatorEpilogue.
     ):
         super().__init__()
         self.w_dim = w_dim
         self.mix_prob = mix_prob
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.style_generator = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.style_generator = SynthesisNetwork(
+            w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, condition_const=condition_const, **synthesis_kwargs)
 
         self.num_ws = self.style_generator.num_ws
         # self.fine_img_mapping = ImgMappingNetwork(
@@ -1165,6 +1182,8 @@ class UNet(nn.Module):
         logits = torch.sigmoid(self.outc(x))
         return logits
 
+#----------------------------------------------------------------------------
+
 class ImgMappingNetwork(torch.nn.Module):
     def __init__(self,
         w_dim,                          # Intermediate latent (W) dimensionality.
@@ -1182,6 +1201,9 @@ class ImgMappingNetwork(torch.nn.Module):
         self.down3 = Down(256, 512)
         self.down4 = Down(512, 512)
         self.down5 = Down(512, 512)
+        # self.down6 = nn.Sequential(
+        #     nn.Conv2d(512, 512,  kernel_size=4, stride=4),
+        #     nn.ReLU(inplace=True))
         self.fc1 = nn.Sequential(
             nn.Linear(512 * 4 * 4, w_dim),
             nn.BatchNorm1d(512),
@@ -1201,9 +1223,10 @@ class ImgMappingNetwork(torch.nn.Module):
         x = self.down3(x)  # 16 x 16
         x = self.down4(x)  # 8 x 8
         x = self.down5(x)  # 4 x 4
+        # x = self.down6(x)  # 1 x 1
         x = self.fc1(x.view(x.size(0), -1))
         x = self.fc2(x)
-
+        # x = x.view(x.size(0), -1)
         # Update moving average of W.
         if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
             with torch.autograd.profiler.record_function('update_w_avg'):
@@ -1222,4 +1245,32 @@ class ImgMappingNetwork(torch.nn.Module):
                     x = self.w_avg.lerp(x, truncation_psi)
                 else:
                     x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+        return x
+
+#----------------------------------------------------------------------------
+
+class ConstMappingNetwork(torch.nn.Module):
+    def __init__(self,
+        img_channels,                   # Number of input color channels.
+        out_channels,                    # Number of intermediate latents to output, None = do not broadcast.
+    ):
+        super().__init__()
+        print('not now')
+        sys.exit()
+        self.out_channels = out_channels
+
+        self.inc = DoubleConv(img_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 512)
+        self.down5 = Down(512, out_channels)
+
+    def forward(self, img):
+        x = self.inc(img)
+        x = self.down1(x)  # 64 x 64
+        x = self.down2(x)  # 32 x 32
+        x = self.down3(x)  # 16 x 16
+        x = self.down4(x)  # 8 x 8
+        x = self.down5(x)  # 4 x 4
         return x
