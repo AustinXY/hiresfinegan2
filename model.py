@@ -247,6 +247,69 @@ class MappingNetwork(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
+class _ImgMappingNetwork(torch.nn.Module):
+    def __init__(self,
+        w_dim,                          # Intermediate latent (W) dimensionality.
+        img_resolution,                 # Input resolution.
+        img_channels,                   # Number of input color channels.
+        num_ws,                         # Number of intermediate latents to output, None = do not broadcast.
+        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+        channel_base        = 32768,    # Overall multiplier for the number of channels.
+        channel_max         = 512,      # Maximum number of channels in any layer.
+        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
+        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
+        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+    ):
+        super().__init__()
+        self.w_dim = w_dim
+        self.num_ws = num_ws
+        self.img_resolution = img_resolution
+        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.img_channels = img_channels
+        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
+        fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
+
+        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+        cur_layer_idx = 0
+        for res in self.block_resolutions:
+            in_channels = channels_dict[res] if res < img_resolution else 0
+            tmp_channels = channels_dict[res]
+            out_channels = channels_dict[res // 2]
+            use_fp16 = (res >= fp16_resolution)
+            block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
+                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
+            setattr(self, f'b{res}', block)
+            cur_layer_idx += block.num_layers
+
+        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=0, resolution=4, c_dim=w_dim, predict_c=True, **epilogue_kwargs, **common_kwargs)
+
+    def forward(self, img, truncation_psi=1, truncation_cutoff=None, **block_kwargs):
+        x = None
+        for res in self.block_resolutions:
+            block = getattr(self, f'b{res}')
+            x, img = block(x, img, **block_kwargs)
+
+        x = self.b4(x, img, None)[1]
+
+        # Broadcast.
+        if self.num_ws is not None:
+            with torch.autograd.profiler.record_function('broadcast'):
+                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+
+        # Apply truncation.
+        if truncation_psi != 1:
+            with torch.autograd.profiler.record_function('truncate'):
+                assert self.w_avg_beta is not None
+                if self.num_ws is None or truncation_cutoff is None:
+                    x = self.w_avg.lerp(x, truncation_psi)
+                else:
+                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+        return x
+
+#----------------------------------------------------------------------------
+
 class SynthesisLayer(torch.nn.Module):
     def __init__(self,
         in_channels,                    # Number of input channels.
@@ -470,96 +533,47 @@ class SynthesisNetwork(torch.nn.Module):
 
 class Generator(torch.nn.Module):
     def __init__(self,
-        z_dim,                      # Input latent (Z) dimensionality.
-        b_dim,
-        p_dim,
-        c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
         img_resolution,             # Output resolution.
         img_channels,               # Number of output color channels.
-        p_res               = None, # p stage resolution
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
-        mix_prob = 0.9
+        mix_prob = 0.9,
+        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
     ):
         super().__init__()
-        self.z_dim = z_dim
-        self.c_dim = c_dim
         self.w_dim = w_dim
         self.mix_prob = mix_prob
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.synthesis_bg = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
-        self.synthesis_fg = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
-        self.num_ws = self.synthesis_bg.num_ws
+        self.style_generator = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
 
-        if p_res is None:
-            p_res = img_resolution // 4
-        num_c_ws = img_resolution // p_res
-        num_p_ws = self.num_ws - num_c_ws
+        self.num_ws = self.style_generator.num_ws
+        # self.fine_img_mapping = ImgMappingNetwork(
+        #     w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, num_ws=self.num_ws, epilogue_kwargs=epilogue_kwargs, **mapping_kwargs)
 
-        self.mapping_b = MappingNetwork(z_dim=z_dim, c_dim=b_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
-        self.mapping_p = MappingNetwork(z_dim=z_dim, c_dim=p_dim, w_dim=w_dim, num_ws=num_p_ws, **mapping_kwargs)
-        self.mapping_c = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=num_c_ws, **mapping_kwargs)
+        self.fine_img_mapping = ImgMappingNetwork(w_dim=w_dim, img_channels=img_channels, num_ws=self.num_ws)
 
-    def style_mixing(self, z, b, p, c):
-        ws_b = self.mapping_b(z, b)
-        cutoff = torch.empty([], dtype=torch.int64, device=ws_b.device).random_(1, ws_b.shape[1])
-        cutoff = torch.where(torch.rand([], device=ws_b.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_b.shape[1]))
-        ws_b[:, cutoff:] = self.mapping_b(torch.randn_like(z), b, skip_w_avg_update=True)[:, cutoff:]
-
-        ws_p = self.mapping_p(z, p)
-        cutoff = torch.empty([], dtype=torch.int64, device=ws_p.device).random_(1, ws_p.shape[1])
-        cutoff = torch.where(torch.rand([], device=ws_p.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_p.shape[1]))
-        ws_p[:, cutoff:] = self.mapping_p(torch.randn_like(z), p, skip_w_avg_update=True)[:, cutoff:]
-
-        ws_c = self.mapping_c(z, c)
-        cutoff = torch.empty([], dtype=torch.int64, device=ws_c.device).random_(1, ws_c.shape[1])
-        cutoff = torch.where(torch.rand([], device=ws_c.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws_c.shape[1]))
-        ws_c[:, cutoff:] = self.mapping_c(torch.randn_like(z), c, skip_w_avg_update=True)[:, cutoff:]
-
-        ws_fg = torch.cat((ws_p, ws_c), dim=1)
-        return [ws_b, ws_fg]
+    def style_mixing(self, fine_img):
+        ws = self.fine_img_mapping(fine_img)
+        # cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+        # cutoff = torch.where(torch.rand([], device=ws.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
+        # ws[:, cutoff:] = self.mapping_b(torch.randn_like(z), b, skip_w_avg_update=True)[:, cutoff:]
+        return ws
 
     def generate(self, ws, **synthesis_kwargs):
-        ws_bg, ws_fg = ws
-        bg_skip_li = self.synthesis_bg(ws_bg, **synthesis_kwargs)
-        fg_skip_li = self.synthesis_fg(ws_fg, **synthesis_kwargs)
+        skip_li = self.style_generator(ws, **synthesis_kwargs)
+        style_img = skip_li[-1]
+        return style_img
 
-        b_skip = bg_skip_li[-1]
-        p_skip = fg_skip_li[-3]
-        c_skip = fg_skip_li[-1]
-
-        b_image = b_skip[:, 0:3, :, :]
-        p_image = p_skip[:, 0:3, :, :]
-        p_mask = p_skip[:, 3:4, :, :]
-        p_mask = torch.sigmoid(p_mask)
-        c_image = c_skip[:, 0:3, :, :]
-        c_mask = c_skip[:, 3:4, :, :]
-        c_mask = torch.sigmoid(c_mask)
-
-        b_mkd = (torch.ones_like(c_mask)-c_mask) * b_image
-        p_mkd = p_mask * p_image
-        c_mkd = c_mask * c_image
-        fnl_image = b_mkd + c_mkd
-
-        raw_images = [b_image, p_image, c_image]
-        mkd_images = [b_mkd, p_mkd, c_mkd]
-        masks = [p_mask, c_mask]
-        return [fnl_image, raw_images, mkd_images, masks]
-
-    def forward(self, z, b, p, c, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+    def forward(self, fine_img, mix_style=False, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         if mix_style:
-            ws = self.style_mixing(z, b, p, c)
+            ws = self.style_mixing(fine_img)
         else:
-            ws_b = self.mapping_b(z, b, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            ws_p = self.mapping_p(z, p, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            ws_c = self.mapping_c(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            ws_fg = torch.cat((ws_p, ws_c), dim=1)
-            ws = [ws_b, ws_fg]
+            ws = self.fine_img_mapping(fine_img)
 
-        image_li = self.generate(ws=ws, **synthesis_kwargs)
-        return image_li
+        style_img = self.generate(ws=ws, **synthesis_kwargs)
+        return style_img
 
 #----------------------------------------------------------------------------
 
@@ -700,7 +714,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
         self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
         self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
-        if predict_c:
+        if predict_c and c_dim != 0:
             self.pred_linear = FullyConnectedLayer(in_channels, c_dim)
 
     def forward(self, x, img, cmap, force_fp32=False):
@@ -725,6 +739,8 @@ class DiscriminatorEpilogue(torch.nn.Module):
         if self.predict_c:
             _c = self.pred_linear(x)
             return [_x, _c]
+
+        x = _x
 
         # Conditioning.
         if self.cmap_dim > 0:
@@ -780,7 +796,8 @@ class Discriminator(torch.nn.Module):
             cur_layer_idx += block.num_layers
         if not predict_c and c_dim > 0:
             self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
-        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, c_dim=c_dim, **epilogue_kwargs, **common_kwargs)
+        self.b4 = DiscriminatorEpilogue(
+            channels_dict[4], cmap_dim=cmap_dim, resolution=4, c_dim=c_dim, predict_c=predict_c, ** epilogue_kwargs, **common_kwargs)
 
     def forward(self, img, c=None, **block_kwargs):
         x = None
@@ -795,336 +812,253 @@ class Discriminator(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
-# class MnetConv(nn.Module):
-#     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=False):
-#         super().__init__()
-#         self.input_conv = nn.Conv2d(
-#             in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
-#         self.mask_conv = nn.Conv2d(
-#             1, 1, kernel_size, stride, padding, dilation, groups, False)
 
-#         # mask is not updated
-#         for param in self.mask_conv.parameters():
-#             param.requires_grad = False
+# ############## FINE_G networks ################################################
+# Upsale the spatial size by a factor of 2
+class GLU(nn.Module):
+    def __init__(self):
+        super(GLU, self).__init__()
 
-#     def forward(self, input, mask):
-#         """
-#         input is regular tensor with shape N*C*H*W
-#         mask has to have 1 channel N*1*H*W
-#         """
-#         output = self.input_conv(input)
-#         if mask is not None:
-#             mask = self.mask_conv(mask)
-#         return output, mask
+    def forward(self, x):
+        nc = x.size(1)
+        assert nc % 2 == 0, 'channels dont divide 2!'
+        nc = int(nc/2)
+        return x[:, :nc] * torch.sigmoid(x[:, nc:])
 
 
-# class downBlock_mnet(nn.Module):
-#     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, dilation=1, groups=1, bias=False):
-#         super().__init__()
-#         self.conv = MnetConv(in_channels, out_channels,
-#                              kernel_size, stride, padding, dilation, groups, bias)
-#         # self.bn = nn.BatchNorm2d(out_channels)
-
-#     def forward(self, input, mask=None):
-#         """
-#         input is regular tensor with shape N*C*H*W
-#         mask has to have 1 channel N*1*H*W
-#         """
-#         output, mask = self.conv(input, mask)
-#         # output = self.bn(output)
-#         output = F.leaky_relu(output, 0.2, inplace=True)
-#         output = F.avg_pool2d(output, 2)
-#         if mask is not None:
-#             mask = F.avg_pool2d(mask, 2)
-#         return output, mask
+def conv3x3(in_planes, out_planes):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=1,
+                     padding=1, bias=False)
 
 
-# def fromRGB_layer(out_planes):
-#     layer = nn.Sequential(
-#         nn.Conv2d(3, out_planes, 1, 1, 0, bias=False),
-#         nn.LeakyReLU(0.2, inplace=True)
-#     )
-#     return layer
+def convlxl(in_planes, out_planes):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=13, stride=1,
+                     padding=1, bias=False)
+
+def upBlock(in_planes, out_planes):
+    block = nn.Sequential(
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        conv3x3(in_planes, out_planes * 2),
+        nn.BatchNorm2d(out_planes * 2),
+        GLU()
+    )
+    return block
+
+def sameBlock(in_planes, out_planes):
+    block = nn.Sequential(
+        conv3x3(in_planes, out_planes * 2),
+        nn.BatchNorm2d(out_planes * 2),
+        GLU()
+    )
+    return block
+
+# Keep the spatial size
+def Block3x3_relu(in_planes, out_planes):
+    block = nn.Sequential(
+        conv3x3(in_planes, out_planes * 2),
+        nn.BatchNorm2d(out_planes * 2),
+        GLU()
+    )
+    return block
 
 
-# class D_NET_BG_BASE(nn.Module):
-#     def __init__(self, ndf):
-#         super().__init__()
-#         self.df_dim = ndf
-#         self.define_module()
-
-#     def define_module(self):
-#         ndf = self.df_dim
-#         self.conv = MnetConv(ndf, ndf * 2, 3, 1, 1)
-#         self.conv_uncond_logits1 = MnetConv(ndf * 2, 1, 3, 1, 1)
-#         self.conv_uncond_logits2 = MnetConv(ndf * 2, 1, 3, 1, 1)
-
-#     def forward(self, x_code, mask):
-#         x_code, mask = self.conv(x_code, mask)
-#         x_code = F.leaky_relu(x_code, 0.2, inplace=True)
-#         _x_code, _mask = self.conv_uncond_logits1(x_code, mask)
-#         classi_score = torch.sigmoid(_x_code)
-#         _x_code, _mask = self.conv_uncond_logits2(x_code, mask)
-#         rf_score = torch.sigmoid(_x_code)
-#         return [classi_score, rf_score], _mask
+class ResBlock(nn.Module):
+    def __init__(self, channel_num):
+        super(ResBlock, self).__init__()
+        self.block = nn.Sequential(
+            conv3x3(channel_num, channel_num * 2),
+            nn.BatchNorm2d(channel_num * 2),
+            GLU(),
+            conv3x3(channel_num, channel_num),
+            nn.BatchNorm2d(channel_num)
+        )
 
 
-# class D_NET_BG(nn.Module):
-#     def __init__(self, start_depth):
-#         super().__init__()
-#         self.df_dim = 256
-#         self.start_depth = start_depth
-#         self.define_module()
-
-#     def define_module(self):
-#         ndf = self.df_dim
-#         self.from_RGB_net = nn.ModuleList([fromRGB_layer(ndf)])
-#         self.down_net = nn.ModuleList([D_NET_BG_BASE(ndf)])
-#         ndf = ndf // 2
-#         for _ in range(self.start_depth):
-#             self.from_RGB_net.append(fromRGB_layer(ndf))
-#             self.down_net.append(downBlock_mnet(ndf, ndf * 2, 3, 1, 1))
-#             ndf = ndf // 2
-
-#         self.df_dim = ndf
-#         self.cur_depth = self.start_depth
-
-#     def forward(self, x_var, alpha=None, mask=None):
-#         x_code = self.from_RGB_net[self.cur_depth](x_var)
-#         for i in range(self.cur_depth, -1, -1):
-#             x_code, mask = self.down_net[i](x_code, mask)
-#             if i == self.cur_depth and i != self.start_depth and alpha < 1:
-#                 y_var = F.avg_pool2d(x_var, 2)
-#                 y_code = self.from_RGB_net[i-1](y_var)
-#                 x_code = (1 - alpha) * y_code + alpha * x_code
-
-#         rf_score = x_code[1]
-#         return [rf_score, None, mask]
+    def forward(self, x):
+        residual = x
+        out = self.block(x)
+        out += residual
+        return out
 
 
-#----------------------------------------------------------------------------
+class INIT_STAGE_G(nn.Module):
+    def __init__(self, ngf, c_flag, z_dim=100, p_dim=20, c_dim=200):
+        super(INIT_STAGE_G, self).__init__()
+        self.gf_dim = ngf
+        self.c_flag= c_flag
 
-class Discriminator_BG(torch.nn.Module):
-    def __init__(self,
-        img_resolution,                 # Input resolution.
-        img_channels,                   # Number of input color channels.
-        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
-        channel_base        = 32768,    # Overall multiplier for the number of channels.
-        channel_max         = 512,      # Maximum number of channels in any layer.
-        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
-        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
-        cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
-        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
-        # epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
-    ):
-        super().__init__()
-        self.img_resolution = img_resolution
-        self.img_resolution_log2 = int(np.log2(img_resolution))
-        self.img_channels = img_channels
-        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, int(np.log2(32)), -1)]
+        if self.c_flag==1 :
+            self.in_dim = z_dim + p_dim
+        elif self.c_flag==2:
+            self.in_dim = z_dim + c_dim
 
-        channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
-        channels_dict[32] = 1
-        fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
+        self.define_module()
 
-        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
-        cur_layer_idx = 0
-        for res in self.block_resolutions:
-            in_channels = channels_dict[res] if res < img_resolution else 0
-            tmp_channels = channels_dict[res]
-            out_channels = channels_dict[res // 2]
-            use_fp16 = (res >= fp16_resolution)
-            block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
-                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
-            setattr(self, f'b{res}', block)
-            cur_layer_idx += block.num_layers
+    def define_module(self):
+        in_dim = self.in_dim
+        ngf = self.gf_dim
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, ngf * 4 * 4 * 2, bias=False),
+            nn.BatchNorm1d(ngf * 4 * 4 * 2),
+            GLU())
 
-    def forward(self, img, **block_kwargs):
-        x = None
-        for res in self.block_resolutions:
-            block = getattr(self, f'b{res}')
-            x, img = block(x, img, **block_kwargs)
-
-        return x
-
-#----------------------------------------------------------------------------
-
-class Discriminator_BG_BBOX(torch.nn.Module):
-    def __init__(self,
-        img_resolution,                 # Input resolution.
-        img_channels        = 1,        # Number of input color channels.
-        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
-        # channel_base        = 32768,    # Overall multiplier for the number of channels.
-        # channel_max         = 512,      # Maximum number of channels in any layer.
-        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
-        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
-        cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
-        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
-        # epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
-    ):
-        super().__init__()
-        self.img_resolution = img_resolution
-        self.img_resolution_log2 = int(np.log2(img_resolution))
-        self.img_channels = img_channels
-        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, int(np.log2(32)), -1)]
-
-        channels_dict = {res: 1 for res in self.block_resolutions}
-        channels_dict[32] = 1
-        fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
-
-        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
-        cur_layer_idx = 0
-        for res in self.block_resolutions:
-            in_channels = channels_dict[res] if res < img_resolution else 0
-            tmp_channels = channels_dict[res]
-            out_channels = channels_dict[res // 2]
-            use_fp16 = (res >= fp16_resolution)
-            block = DiscriminatorBlock_BBOX(in_channels, tmp_channels, out_channels, resolution=res,
-                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
-            setattr(self, f'b{res}', block)
-            cur_layer_idx += block.num_layers
-
-    def forward(self, img, **block_kwargs):
-        x = None
-        for res in self.block_resolutions:
-            block = getattr(self, f'b{res}')
-            x, img = block(x, img, **block_kwargs)
-
-        return x
-
-#----------------------------------------------------------------------------
-
-class Conv2dLayer_BBOX(torch.nn.Module):
-    def __init__(self,
-        in_channels,                    # Number of input channels.
-        out_channels,                   # Number of output channels.
-        kernel_size,                    # Width and height of the convolution kernel.
-        bias            = False,        # Apply additive bias before the activation function?
-        activation      = 'linear',     # Activation function: 'relu', 'lrelu', etc.
-        up              = 1,            # Integer upsampling factor.
-        down            = 1,            # Integer downsampling factor.
-        resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
-        conv_clamp      = None,         # Clamp the output to +-X, None = disable clamping.
-        channels_last   = False,        # Expect the input to have memory_format=channels_last?
-        trainable       = False,        # Update the weights of this layer during training?
-    ):
-        super().__init__()
-        self.activation = activation
-        self.up = up
-        self.down = down
-        self.conv_clamp = conv_clamp
-        self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
-        self.padding = kernel_size // 2
-        self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
-        self.act_gain = bias_act.activation_funcs[activation].def_gain
-
-        memory_format = torch.channels_last if channels_last else torch.contiguous_format
-        weight = torch.ones([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
-        bias = torch.zeros([out_channels]) if bias else None
-        if trainable:
-            self.weight = torch.nn.Parameter(weight)
-            self.bias = torch.nn.Parameter(bias) if bias is not None else None
-        else:
-            self.register_buffer('weight', weight)
-            if bias is not None:
-                self.register_buffer('bias', bias)
-            else:
-                self.bias = None
-
-    def forward(self, x, gain=1):
-        w = self.weight * self.weight_gain
-        b = self.bias.to(x.dtype) if self.bias is not None else None
-        flip_weight = (self.up == 1) # slightly faster
-        x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
-
-        act_gain = self.act_gain * gain
-        act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
-        x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=act_clamp)
-        return x
+        self.upsample1 = upBlock(ngf, ngf // 2)
+        self.upsample2 = upBlock(ngf // 2, ngf // 4)
+        self.upsample3 = upBlock(ngf // 4, ngf // 8)
+        self.upsample4 = upBlock(ngf // 8, ngf // 16)
+        self.upsample5 = upBlock(ngf // 16, ngf // 16)
 
 
-#----------------------------------------------------------------------------
+    def forward(self, z_code, code):
 
-class DiscriminatorBlock_BBOX(torch.nn.Module):
-    def __init__(self,
-        in_channels,                        # Number of input channels, 0 = first block.
-        tmp_channels,                       # Number of intermediate channels.
-        out_channels,                       # Number of output channels.
-        resolution,                         # Resolution of this block.
-        img_channels,                       # Number of input color channels.
-        first_layer_idx,                    # Index of the first layer.
-        architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
-        activation          = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
-        resample_filter     = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
-        conv_clamp          = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
-        use_fp16            = False,        # Use FP16 for this block?
-        fp16_channels_last  = False,        # Use channels-last memory format with FP16?
-        freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
-    ):
-        assert in_channels in [0, tmp_channels]
-        assert architecture in ['orig', 'skip', 'resnet']
-        super().__init__()
-        self.in_channels = in_channels
-        self.resolution = resolution
-        self.img_channels = img_channels
-        self.first_layer_idx = first_layer_idx
-        self.architecture = architecture
-        self.use_fp16 = use_fp16
-        self.channels_last = (use_fp16 and fp16_channels_last)
-        self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+        in_code = torch.cat((code, z_code), 1)
+        out_code = self.fc(in_code)
+        out_code = out_code.view(-1, self.gf_dim, 4, 4)
+        out_code = self.upsample1(out_code)
+        out_code = self.upsample2(out_code)
+        out_code = self.upsample3(out_code)
+        out_code = self.upsample4(out_code)
+        out_code = self.upsample5(out_code)
 
-        self.num_layers = 0
-        def trainable_gen():
-            while True:
-                layer_idx = self.first_layer_idx + self.num_layers
-                trainable = (layer_idx >= freeze_layers)
-                self.num_layers += 1
-                yield trainable
-        trainable_iter = trainable_gen()
+        return out_code
 
-        if in_channels == 0 or architecture == 'skip':
-            self.fromrgb = Conv2dLayer_BBOX(img_channels, tmp_channels, kernel_size=1, activation=activation,
-                trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
 
-        self.conv0 = Conv2dLayer_BBOX(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
-            trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
+class NEXT_STAGE_G(nn.Module):
+    def __init__(self, ngf, use_hrc=1, num_residual=2, p_dim=20, c_dim=200):
+        super(NEXT_STAGE_G, self).__init__()
+        self.gf_dim = ngf
+        if use_hrc == 1: # For parent stage
+            self.ef_dim = p_dim
+        else:            # For child stage
+            self.ef_dim = c_dim
 
-        self.conv1 = Conv2dLayer_BBOX(tmp_channels, out_channels, kernel_size=3, activation=activation, down=2,
-            trainable=next(trainable_iter), resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last)
+        self.num_residual = num_residual
+        self.define_module()
 
-        if architecture == 'resnet':
-            self.skip = Conv2dLayer_BBOX(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
-                trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
+    def _make_layer(self, block, channel_num):
+        layers = []
+        for i in range(self.num_residual):
+            layers.append(block(channel_num))
+        return nn.Sequential(*layers)
 
-    def forward(self, x, img, force_fp32=False):
-        dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
-        memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
+    def define_module(self):
+        ngf = self.gf_dim
+        efg = self.ef_dim
+        self.jointConv = Block3x3_relu(ngf + efg, ngf)
+        self.residual = self._make_layer(ResBlock, ngf)
+        self.samesample = sameBlock(ngf, ngf // 2)
 
-        # Input.
-        if x is not None:
-            misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
-            x = x.to(dtype=dtype, memory_format=memory_format)
+    def forward(self, h_code, code):
+        s_size = h_code.size(2)
+        code = code.view(-1, self.ef_dim, 1, 1)
+        code = code.repeat(1, 1, s_size, s_size)
+        h_c_code = torch.cat((code, h_code), 1)
+        out_code = self.jointConv(h_c_code)
+        out_code = self.residual(out_code)
+        out_code = self.samesample(out_code)
+        return out_code
 
-        # FromRGB.
-        if self.in_channels == 0 or self.architecture == 'skip':
-            misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
-            img = img.to(dtype=dtype, memory_format=memory_format)
-            y = self.fromrgb(img)
-            x = x + y if x is not None else y
-            img = upfirdn2d.downsample2d(img, self.resample_filter) if self.architecture == 'skip' else None
 
-        # Main layers.
-        if self.architecture == 'resnet':
-            y = self.skip(x, gain=np.sqrt(0.5))
-            x = self.conv0(x)
-            x = self.conv1(x, gain=np.sqrt(0.5))
-            x = y.add_(x)
-        else:
-            x = self.conv0(x)
-            x = self.conv1(x)
 
-        assert x.dtype == dtype
-        return x, img
+class GET_IMAGE_G(nn.Module):
+    def __init__(self, ngf):
+        super(GET_IMAGE_G, self).__init__()
+        self.gf_dim = ngf
+        self.img = nn.Sequential(
+            conv3x3(ngf, 3),
+            nn.Tanh()
+        )
+
+    def forward(self, h_code):
+        out_img = self.img(h_code)
+        return out_img
+
+
+
+class GET_MASK_G(nn.Module):
+    def __init__(self, ngf):
+        super(GET_MASK_G, self).__init__()
+        self.gf_dim = ngf
+        self.img = nn.Sequential(
+            conv3x3(ngf, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, h_code):
+        out_img = self.img(h_code)
+        return out_img
+
+
+class G_NET(nn.Module):
+    def __init__(self, gf_dim=64):
+        super(G_NET, self).__init__()
+        self.gf_dim = gf_dim
+        self.define_module()
+        self.upsampling = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.scale_fimg = nn.UpsamplingBilinear2d(size = [126, 126])
+
+    def define_module(self):
+        #Background stage
+        self.h_net1_bg = INIT_STAGE_G(self.gf_dim * 16, 2)
+        self.img_net1_bg = GET_IMAGE_G(self.gf_dim) # Background generation network
+
+        # Parent stage networks
+        self.h_net1 = INIT_STAGE_G(self.gf_dim * 16, 1)
+        self.h_net2 = NEXT_STAGE_G(self.gf_dim, use_hrc = 1)
+        self.img_net2 = GET_IMAGE_G(self.gf_dim // 2)  # Parent foreground generation network
+        self.img_net2_mask= GET_MASK_G(self.gf_dim // 2) # Parent mask generation network
+
+        # Child stage networks
+        self.h_net3 = NEXT_STAGE_G(self.gf_dim // 2, use_hrc = 0)
+        self.img_net3 = GET_IMAGE_G(self.gf_dim // 4) # Child foreground generation network
+        self.img_net3_mask = GET_MASK_G(self.gf_dim // 4) # Child mask generation network
+
+    def forward(self, z_code, bg_code, p_code, c_code):
+        fake_imgs = [] # Will contain [background image, parent image, child image]
+        fg_imgs = [] # Will contain [parent foreground, child foreground]
+        mk_imgs = [] # Will contain [parent mask, child mask]
+        fg_mk = [] # Will contain [masked parent foreground, masked child foreground]
+
+        #Background stage
+        h_code1_bg = self.h_net1_bg(z_code, bg_code)
+        fake_img1 = self.img_net1_bg(h_code1_bg) # Background image
+        fake_img1_126 = self.scale_fimg(fake_img1) # Resizing fake background image from 128x128 to the resolution which background discriminator expects: 126 x 126.
+        fake_imgs.append(fake_img1_126)
+
+        #Parent stage
+        h_code1 = self.h_net1(z_code, p_code)
+        h_code2 = self.h_net2(h_code1, p_code)
+        fake_img2_foreground = self.img_net2(h_code2) # Parent foreground
+        fake_img2_mask = self.img_net2_mask(h_code2) # Parent mask
+        ones_mask_p = torch.ones_like(fake_img2_mask)
+        opp_mask_p = ones_mask_p - fake_img2_mask
+        fg_masked2 = torch.mul(fake_img2_foreground, fake_img2_mask)
+        fg_mk.append(fg_masked2)
+        bg_masked2 = torch.mul(fake_img1, opp_mask_p)
+        fake_img2_final = fg_masked2 + bg_masked2 # Parent image
+        fake_imgs.append(fake_img2_final)
+        fg_imgs.append(fake_img2_foreground)
+        mk_imgs.append(fake_img2_mask)
+
+        #Child stage
+        h_code3 = self.h_net3(h_code2, c_code)
+        fake_img3_foreground = self.img_net3(h_code3) # Child foreground
+        fake_img3_mask = self.img_net3_mask(h_code3) # Child mask
+        ones_mask_c = torch.ones_like(fake_img3_mask)
+        opp_mask_c = ones_mask_c - fake_img3_mask
+        fg_masked3 = torch.mul(fake_img3_foreground, fake_img3_mask)
+        fg_mk.append(fg_masked3)
+        bg_masked3 = torch.mul(fake_img2_final, opp_mask_c)
+        fake_img3_final = fg_masked3 + bg_masked3  # Child image
+        fake_imgs.append(fake_img3_final)
+        fg_imgs.append(fake_img3_foreground)
+        mk_imgs.append(fake_img3_mask)
+
+        return fake_img3_final
+        # return fake_imgs, fg_imgs, mk_imgs, fg_mk
+
 
 #----------------------------------------------------------------------------
 
@@ -1230,3 +1164,62 @@ class UNet(nn.Module):
         x = self.up4(x, x1)
         logits = torch.sigmoid(self.outc(x))
         return logits
+
+class ImgMappingNetwork(torch.nn.Module):
+    def __init__(self,
+        w_dim,                          # Intermediate latent (W) dimensionality.
+        img_channels,                   # Number of input color channels.
+        num_ws,                         # Number of intermediate latents to output, None = do not broadcast.
+        w_avg_beta      = 0.995,    # Decay for tracking the moving average of W during training, None = do not track.
+    ):
+        super().__init__()
+        self.num_ws = num_ws
+        self.w_avg_beta = w_avg_beta
+
+        self.inc = DoubleConv(img_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 512)
+        self.down5 = Down(512, 512)
+        self.fc1 = nn.Sequential(
+            nn.Linear(512 * 4 * 4, w_dim),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True))
+        self.fc2 = nn.Sequential(
+            nn.Linear(w_dim, w_dim),
+            nn.BatchNorm1d(w_dim),
+            nn.ReLU(inplace=True))
+
+        if num_ws is not None and w_avg_beta is not None:
+            self.register_buffer('w_avg', torch.zeros([w_dim]))
+
+    def forward(self, img, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
+        x = self.inc(img)
+        x = self.down1(x)  # 64 x 64
+        x = self.down2(x)  # 32 x 32
+        x = self.down3(x)  # 16 x 16
+        x = self.down4(x)  # 8 x 8
+        x = self.down5(x)  # 4 x 4
+        x = self.fc1(x.view(x.size(0), -1))
+        x = self.fc2(x)
+
+        # Update moving average of W.
+        if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
+            with torch.autograd.profiler.record_function('update_w_avg'):
+                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+
+        # Broadcast.
+        if self.num_ws is not None:
+            with torch.autograd.profiler.record_function('broadcast'):
+                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+
+        # Apply truncation.
+        if truncation_psi != 1:
+            with torch.autograd.profiler.record_function('truncate'):
+                assert self.w_avg_beta is not None
+                if self.num_ws is None or truncation_cutoff is None:
+                    x = self.w_avg.lerp(x, truncation_psi)
+                else:
+                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+        return x
