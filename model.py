@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
+from tqdm.std import trange
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
 
@@ -174,7 +175,7 @@ class ModulatedConv2d(nn.Module):
         in_channel,
         out_channel,
         kernel_size,
-        style_dim,
+        w_dim,
         demodulate=True,
         upsample=False,
         downsample=False,
@@ -215,7 +216,7 @@ class ModulatedConv2d(nn.Module):
             torch.randn(1, out_channel, in_channel, kernel_size, kernel_size)
         )
 
-        self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
+        self.modulation = EqualLinear(w_dim, in_channel, bias_init=1)
 
         self.demodulate = demodulate
         self.fused = fused
@@ -340,7 +341,7 @@ class StyledConv(nn.Module):
         in_channel,
         out_channel,
         kernel_size,
-        style_dim,
+        w_dim,
         upsample=False,
         blur_kernel=[1, 3, 3, 1],
         demodulate=True,
@@ -351,7 +352,7 @@ class StyledConv(nn.Module):
             in_channel,
             out_channel,
             kernel_size,
-            style_dim,
+            w_dim,
             upsample=upsample,
             blur_kernel=blur_kernel,
             demodulate=demodulate,
@@ -372,14 +373,14 @@ class StyledConv(nn.Module):
 
 
 class ToRGB(nn.Module):
-    def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, in_channel, w_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
         super().__init__()
 
         if upsample:
             self.upsample = Upsample(blur_kernel)
 
         self.conv = ModulatedConv2d(
-            in_channel, 3, 1, style_dim, demodulate=False)
+            in_channel, 3, 1, w_dim, demodulate=False)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
     def forward(self, input, style, skip=None):
@@ -393,33 +394,66 @@ class ToRGB(nn.Module):
 
         return out
 
+#----------------------------------------------------------------------------
 
-class Generator(nn.Module):
+class MappingNetwork(nn.Module):
     def __init__(
         self,
-        size,
-        style_dim,
-        n_mlp,
-        channel_multiplier=2,
-        blur_kernel=[1, 3, 3, 1],
-        lr_mlp=0.01,
+        z_dim,          # Input latent (Z) dimensionality.
+        w_dim,          # Intermediate latent (W) dimensionality.
+        n_mlp,          # Number of mapping layers.
+        lr_mlp = 0.01,
     ):
         super().__init__()
-
-        self.size = size
-
-        self.style_dim = style_dim
+        self.z_dim = z_dim
+        self.w_dim = w_dim
 
         layers = [PixelNorm()]
 
-        for i in range(n_mlp):
+        for _ in range(n_mlp):
             layers.append(
                 EqualLinear(
-                    style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
+                    z_dim, w_dim, lr_mul=lr_mlp, activation="fused_lrelu"
                 )
             )
 
         self.style = nn.Sequential(*layers)
+
+    def forward(self, z, truncation=1, truncation_latent=None):
+        # Main layers.
+        x = self.style(z)
+
+        # Apply truncation.
+        if truncation < 1:
+            x = truncation_latent + truncation * (x - truncation_latent)
+
+        return x
+
+#----------------------------------------------------------------------------
+
+class Generator(nn.Module):
+    def __init__(
+        self,
+        img_resolution,
+        z_dim,                              # Input latent (Z) dimensionality.
+        w_dim,                              # Intermediate latent (W) dimensionality.
+        n_mlp,                              # Number of mapping layers.
+        mix_prob           = 0.9,           # style mixing probability.
+        channel_multiplier = 2,
+        blur_kernel        = [1, 3, 3, 1],
+        lr_mlp             = 0.01,
+    ):
+        super().__init__()
+
+        self.img_resolution = img_resolution
+        self.w_dim = w_dim
+        self.z_dim = z_dim
+        self.mix_prob = mix_prob
+
+        self.log_size = int(math.log(img_resolution, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.num_ws = self.log_size * 2 - 2
+        self.mapping = MappingNetwork(z_dim, w_dim, n_mlp, lr_mlp=lr_mlp)
 
         self.channels = {
             4: 512,
@@ -435,12 +469,9 @@ class Generator(nn.Module):
 
         self.input = ConstantInput(self.channels[4])
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 3, w_dim, blur_kernel=blur_kernel
         )
-        self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
-
-        self.log_size = int(math.log(size, 2))
-        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.to_rgb1 = ToRGB(self.channels[4], w_dim, upsample=False)
 
         self.convs = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -463,7 +494,7 @@ class Generator(nn.Module):
                     in_channel,
                     out_channel,
                     3,
-                    style_dim,
+                    w_dim,
                     upsample=True,
                     blur_kernel=blur_kernel,
                 )
@@ -471,51 +502,59 @@ class Generator(nn.Module):
 
             self.convs.append(
                 StyledConv(
-                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
+                    out_channel, out_channel, 3, w_dim, blur_kernel=blur_kernel
                 )
             )
 
-            self.to_rgbs.append(ToRGB(out_channel, style_dim))
+            self.to_rgbs.append(ToRGB(out_channel, w_dim))
 
             in_channel = out_channel
 
-        self.n_latent = self.log_size * 2 - 2
+    # def make_noise(self):
+    #     device = self.input.input.device
 
-    def make_noise(self):
-        device = self.input.input.device
+    #     noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
 
-        noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
+    #     for i in range(3, self.log_size + 1):
+    #         for _ in range(2):
+    #             noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
 
-        for i in range(3, self.log_size + 1):
-            for _ in range(2):
-                noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
+    #     return noises
 
-        return noises
+    # def mean_latent(self, n_latent):
+    #     latent_in = torch.randn(
+    #         n_latent, self.w_dim, device=self.input.input.device
+    #     )
+    #     latent = self.mapping(latent_in).mean(0, keepdim=True)
 
-    def mean_latent(self, n_latent):
-        latent_in = torch.randn(
-            n_latent, self.style_dim, device=self.input.input.device
-        )
-        latent = self.style(latent_in).mean(0, keepdim=True)
+    #     return latent
 
+    # def get_latent(self, input):
+    #     return self.mapping(input)
+
+    def style_mixing(self, z, mix_styles=True, truncation=1, truncation_latent=None):
+        latent = self.mapping(z, truncation=truncation, truncation_latent=truncation_latent)
+        if mix_styles and self.mix_prob > 0 and random.random() < self.mix_prob:
+            z2 = torch.randn(z.size(0), self.z_dim, device=z.device)
+            latent2 = self.mapping(z2, truncation=truncation, truncation_latent=truncation_latent)
+            inject_index = random.randint(1, self.num_ws - 1)
+            latent = latent.unsqueeze(1).repeat(1, inject_index, 1)
+            latent2 = latent2.unsqueeze(1).repeat(1, self.num_ws - inject_index, 1)
+            latent = torch.cat([latent, latent2], 1)
+        else:
+            latent = latent.unsqueeze(1).repeat(1, self.num_ws, 1)
         return latent
-
-    def get_latent(self, input):
-        return self.style(input)
 
     def forward(
         self,
-        styles,
+        z,
         return_latents=False,
-        inject_index=None,
-        truncation=1,
-        truncation_latent=None,
-        input_is_latent=False,
+        mix_styles=True,
         noise=None,
         randomize_noise=True,
+        truncation=1,
+        truncation_latent=None,
     ):
-        if not input_is_latent:
-            styles = [self.style(s) for s in styles]
 
         if noise is None:
             if randomize_noise:
@@ -525,35 +564,7 @@ class Generator(nn.Module):
                     getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
                 ]
 
-        if truncation < 1:
-            style_t = []
-
-            for style in styles:
-                style_t.append(
-                    truncation_latent + truncation *
-                    (style - truncation_latent)
-                )
-
-            styles = style_t
-
-        if len(styles) < 2:
-            inject_index = self.n_latent
-
-            if styles[0].ndim < 3:
-                latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-
-            else:
-                latent = styles[0]
-
-        else:
-            if inject_index is None:
-                inject_index = random.randint(1, self.n_latent - 1)
-
-            latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
-            latent2 = styles[1].unsqueeze(1).repeat(
-                1, self.n_latent - inject_index, 1)
-
-            latent = torch.cat([latent, latent2], 1)
+        latent = self.style_mixing(z, mix_styles, truncation=truncation, truncation_latent=truncation_latent)
 
         out = self.input(latent)
         out = self.conv1(out, latent[:, 0], noise=noise[0])

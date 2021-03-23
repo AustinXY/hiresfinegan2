@@ -3,7 +3,7 @@ import math
 import random
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import numpy as np
 import torch
@@ -15,11 +15,10 @@ from torchvision import transforms, utils
 from tqdm import tqdm
 from model import Generator, Discriminator
 
-
 import wandb
 
-
 from dataset import MultiResolutionDataset
+from prepare_data import IMIM
 from distributed import (
     get_rank,
     synchronize,
@@ -101,29 +100,30 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
 
     return path_penalty, path_mean.detach(), path_lengths
 
-
-def make_noise(batch, latent_dim, n_noise, device):
-    if n_noise == 1:
-        return torch.randn(batch, latent_dim, device=device)
-
-    noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0)
-
-    return noises
-
-
-def mixing_noise(batch, latent_dim, prob, device):
-    if prob > 0 and random.random() < prob:
-        return make_noise(batch, latent_dim, 2, device)
-
-    else:
-        return [make_noise(batch, latent_dim, 1, device)]
-
-
 def set_grad_none(model, targets):
     for n, p in model.named_parameters():
         if n in targets:
             p.grad = None
 
+def child_to_parent(c_code, c_dim, p_dim):
+    ratio = c_dim / p_dim
+    cid = torch.argmax(c_code,  dim=1)
+    pid = (cid / ratio).long()
+    p_code = torch.zeros([c_code.size(0), p_dim], device=c_code.device)
+    for i in range(c_code.size(0)):
+        p_code[i][pid[i]] = 1
+    return p_code
+
+def sample_codes(batch, z_dim, b_dim, p_dim, c_dim, device):
+    z = torch.randn(batch, z_dim, device=device)
+    c = torch.zeros(batch, c_dim, device=device)
+    cid = np.random.randint(c_dim, size=batch)
+    for i in range(batch):
+        c[i, cid[i]] = 1
+
+    p = child_to_parent(c, c_dim, p_dim)
+    b = c.clone()
+    return z, b, p, c
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
@@ -160,7 +160,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         ada_augment = AdaptiveAugment(
             args.ada_target, args.ada_length, 8, device)
 
-    sample_z = torch.randn(args.n_sample, args.latent, device=device)
+    # sample_z = torch.randn(args.n_sample, args.w_dim, device=device)
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -170,14 +170,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             break
 
-        real_img = next(loader)
+        real_img, _ = next(loader)
         real_img = real_img.to(device)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+        fake_img, _ = generator(z)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -227,8 +227,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+        fake_img, _ = generator(z)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
@@ -246,9 +246,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
-            noise = mixing_noise(
-                path_batch_size, args.latent, args.mixing, device)
-            fake_img, latents = generator(noise, return_latents=True)
+            z, _, _, _ = sample_codes(path_batch_size, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            fake_img, latents = generator(z, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -308,19 +307,27 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    _sample = None
+                    for _ in range(4):
+                        z, _, _, _ = sample_codes(8, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                        sample, _ = g_ema(z)
+                        if _sample is None:
+                            _sample = sample
+                        else:
+                            _sample = torch.cat([_sample, sample])
+
                     utils.save_image(
-                        sample,
+                        _sample,
                         f"sample/{str(i).zfill(6)}.png",
-                        nrow=int(args.n_sample ** 0.5),
+                        nrow=8,
                         normalize=True,
                         range=(-1, 1),
                     )
 
-            if i % 10000 == 0:
+            if i % 100000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -447,20 +454,38 @@ if __name__ == "__main__":
             backend="nccl", init_method="env://")
         synchronize()
 
-    args.latent = 512
+    args.fine_z_dim = 100
+    args.z_dim = 512
+    args.w_dim = 512
     args.n_mlp = 8
+
+    args.b_dim = 200
+    args.p_dim = 20
+    args.c_dim = 200
 
     args.start_iter = 0
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    ).to(device)
+        img_resolution      = args.size,
+        z_dim               = args.z_dim,
+        w_dim               = args.w_dim,
+        n_mlp               = args.n_mlp,
+        mix_prob            = 0.9,
+        channel_multiplier  = args.channel_multiplier
+    ).train().requires_grad_(False).to(device)
+
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier
-    ).to(device)
+    ).train().requires_grad_(False).to(device)
+
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
-    ).to(device)
+        img_resolution      = args.size,
+        z_dim               = args.z_dim,
+        w_dim               = args.w_dim,
+        n_mlp               = args.n_mlp,
+        mix_prob            = 0.9,
+        channel_multiplier  = args.channel_multiplier
+    ).train().requires_grad_(False).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
