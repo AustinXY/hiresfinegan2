@@ -145,6 +145,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
     mean_path_length_avg = 0
     loss_dict = {}
 
+    log_fine_loss = None
+
     if args.distributed:
         g_module = generator.module
         d_module = discriminator.module
@@ -176,10 +178,14 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-        with torch.no_grad():
-            fine_img = fine_generator(fine_z, b, p, c)
-        fake_img, _ = generator(z=None, fine_img=fine_img)
+        if i % args.fine_train_every == 0:
+            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            with torch.no_grad():
+                fine_img = fine_generator(fine_z, b, p, c)
+            fake_img, _ = generator(z=None, fine_img=fine_img)
+        else:
+            z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            fake_img, _ = generator(z=z, fine_img=None)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -231,25 +237,33 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-        with torch.no_grad():
-            fine_img = fine_generator(fine_z, b, p, c)
-        fake_img, _ = generator(z=None, fine_img=fine_img)
+        if i % args.fine_train_every == 0:
+            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            with torch.no_grad():
+                fine_img = fine_generator(fine_z, b, p, c)
+            fake_img, _ = generator(z=None, fine_img=fine_img)
+        else:
+            z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            fake_img, _ = generator(z=z, fine_img=None)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         # fine loss
-        if args.use_fine_loss:
+        if args.use_fine_loss and i % args.fine_train_every == 0:
             _fine_img = F.interpolate(fine_img, size=(256, 256), mode='area')
             _synth_img = F.interpolate(fake_img, size=(256, 256), mode='area')
             target_features = vgg16(_fine_img, resize_images=False, return_lpips=True)
             synth_features = vgg16(_synth_img, resize_images=False, return_lpips=True)
             fine_loss = (target_features - synth_features).square().sum()
+            log_fine_loss = fine_loss
         else:
             fine_loss = torch.zeros(1, device=device)
 
-        loss_dict["fine"] = fine_loss
+        if log_fine_loss is None:
+            log_fine_loss = torch.zeros(1, device=device)
+
+        loss_dict["fine"] = log_fine_loss
 
         # child rf
         fake_pred = discriminator(fake_img)
@@ -268,10 +282,14 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
 
-            fine_z, b, p, c = sample_codes(path_batch_size, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-            with torch.no_grad():
-                fine_img = fine_generator(fine_z, b, p, c)
-            fake_img, latents = generator(z=None, fine_img=fine_img, return_latents=True)
+            if i % args.fine_train_every == 0:
+                fine_z, b, p, c = sample_codes(path_batch_size, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                with torch.no_grad():
+                    fine_img = fine_generator(fine_z, b, p, c)
+                fake_img, latents = generator(z=None, fine_img=fine_img, return_latents=True)
+            else:
+                z, _, _, _ = sample_codes(path_batch_size, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                fake_img, latents = generator(z=z, fine_img=None, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -506,6 +524,7 @@ if __name__ == "__main__":
     args.c_dim = 200
 
     args.use_fine_loss = False
+    args.fine_train_every = 5  # if 1 then no random sample z training
     args.fine_model = '../../../disk1/yang_data/fine_model/fine_models.pt'
     args.vgg_model = '../../../disk1/yang_data/fine_model/vgg16.pt'
 
