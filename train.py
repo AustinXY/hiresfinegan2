@@ -155,13 +155,16 @@ def child_to_parent(c_code, c_dim, p_dim):
 
 def sample_codes(batch, latent_dim, b_dim, p_dim, c_dim, device):
     z = torch.randn(batch, latent_dim, device=device)
-    c = torch.zeros(batch, c_dim, device=device)
-    cid = np.random.randint(c_dim, size=batch)
-    for i in range(batch):
-        c[i, cid[i]] = 1
+    if c_dim > 0:
+        c = torch.zeros(batch, c_dim, device=device)
+        cid = np.random.randint(c_dim, size=batch)
+        for i in range(batch):
+            c[i, cid[i]] = 1
 
-    p = child_to_parent(c, c_dim, p_dim)
-    b = c.clone()
+        p = child_to_parent(c, c_dim, p_dim)
+        b = c.clone()
+    else:
+        b = p = c = None
     return z, b, p, c
 
 def binarization_loss(mask):
@@ -201,21 +204,6 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    # grid_z = torch.randn([args.n_sample, args.latent], device=device).split(8)
-    # grid_b = torch.zeros([args.n_sample, args.b_dim], device=device)
-    # grid_p = torch.zeros([args.n_sample, args.p_dim], device=device)
-    # grid_c = torch.zeros([args.n_sample, args.c_dim], device=device)
-    # bid = np.random.randint(args.b_dim, size=args.n_sample)
-    # pid = np.random.randint(args.p_dim, size=args.n_sample)
-    # cid = np.random.randint(args.c_dim, size=args.n_sample)
-    # for i in range(args.n_sample):
-    #     grid_b[i, bid[i]] = 1
-    #     grid_p[i, pid[i]] = 1
-    #     grid_c[i, cid[i]] = 1
-    # grid_b = grid_b.split(8)
-    # grid_p = grid_p.split(8)
-    # grid_c = grid_c.split(8)
-
     # criterion_construct = nn.MSELoss()
     criterion_construct = nn.L1Loss()
 
@@ -232,13 +220,17 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         # real_pair = torch.cat((real_img, real_bbox), dim=1)
 
         ############# train child discriminator #############
-        fine_generator.requires_grad_(False)
         generator.requires_grad_(False)
         discriminator.requires_grad_(True)
 
-        z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
-        fine_img = fine_generator(z, b, p, c)
-        fake_img = generator(fine_img, mix_style=False)
+        if i % args.fine_train_every == 0:
+            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            with torch.no_grad():
+                fine_img = fine_generator(fine_z, b, p, c)
+            fake_img = generator(z=None, fine_img=fine_img)
+        else:
+            z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
+            fake_img = generator(z=z, fine_img=None)
 
         real_pred = discriminator(real_img)
         fake_pred = discriminator(fake_img)
@@ -285,9 +277,19 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         generator.requires_grad_(True)
         discriminator.requires_grad_(False)
 
-        z, b, p, c = sample_codes(args.batch, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
-        fine_img = fine_generator(z, b, p, c)
-        style_img = generator(fine_img, mix_style=False)
+        if i % args.fine_train_every == 0:
+            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            with torch.no_grad():
+                fine_img = fine_generator(fine_z, b, p, c)
+            style_img = generator(z=None, fine_img=fine_img)
+        else:
+            z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
+            style_img = generator(z=z, fine_img=None)
+
+
+        fine_loss = torch.zeros(1, device=device)
+
+        loss_dict["fine"] = fine_loss
 
         # if args.augment:
         #     fake_img, _ = augment(fake_img, ada_aug_p)
@@ -301,10 +303,6 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         # fine loss
         # resized_style_img = image_transforms.resize(
         #     style_img, [fine_img.size(-1), fine_img.size(-1)])
-        resized_style_img = style_img
-        fine_loss = criterion_construct(fine_img, resized_style_img) * args.fine_wt
-
-        loss_dict["fine"] = fine_loss
 
         generator_loss = g_loss + fine_loss
 
@@ -316,10 +314,17 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
-            z, b, p, c = sample_codes(path_batch_size, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
-            fine_img = fine_generator(z, b, p, c)
 
-            ws = generator.style_mixing(fine_img)
+            if i % args.fine_train_every == 0:
+                fine_z, b, p, c = sample_codes(path_batch_size, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                with torch.no_grad():
+                    fine_img = fine_generator(fine_z, b, p, c)
+                ws = generator.get_latent(fine_img=fine_img, z=None)
+            else:
+                z, _, _, _ = sample_codes(
+                    args.batch, args.z_dim, 0, 0, 0, device)
+                ws = generator.get_latent(fine_img=None, z=z)
+
             fake_img = generator.generate(ws)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -400,8 +405,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
                     _fine_img = None
                     _style_img = None
-                    for j in range(4):
-                        z, b, p, c = sample_codes(8, args.latent, args.b_dim, args.p_dim, args.c_dim, device)
+                    for _ in range(4):
+                        z, b, p, c = sample_codes(8, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
                         fine_img = fine_generator(z, b, p, c)
                         style_img = g_ema(fine_img, mix_style=False, noise_mode='const')
 
@@ -575,7 +580,8 @@ if __name__ == "__main__":
         spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
         spec.ema = spec.mb * 10 / 32
 
-    args.latent = 100
+    args.fine_z_dim = 100
+    args.z_dim = 512
     args.w_dim = 512
     args.n_mlp = 8
     args.r1_gamma = spec.gamma
@@ -591,6 +597,7 @@ if __name__ == "__main__":
     args.p_dim = 20
     args.c_dim = 200
 
+    args.fine_train_every = 10
     args.fine_model = '../data/fine_model/fine_models.pt'
     args.fine_wt = 0
 
@@ -606,6 +613,7 @@ if __name__ == "__main__":
         img_channels        = 3,                        # Number of output color channels.
         mapping_kwargs      = {},        # Arguments for MappingNetwork.
         condition_const     = False,
+        z_dim               = args.z_dim,
         synthesis_kwargs    = {'channel_base': 32768,
                                'channel_max': 512,
                                'num_fp16_res': 4,
@@ -633,10 +641,10 @@ if __name__ == "__main__":
         predict_c           = False,     # If predict c, then info discriminator, else conditional discriminator.
     ).train().requires_grad_(False).to(device)
 
-    # g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
-    # d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
-    g_reg_ratio = 1
-    d_reg_ratio = 1
+    g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
+    d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
+    # g_reg_ratio = 1
+    # d_reg_ratio = 1
 
     g_optim = optim.Adam(
         generator.parameters(),

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.modules.activation import Tanh
 from torch_utils import misc
 # from torch_utils import persistence
 from torch_utils.ops import conv2d_resample
@@ -208,7 +209,7 @@ class MappingNetwork(torch.nn.Module):
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
+    def forward(self, z, c=None, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
         # Embed, normalize, and concat inputs.
         x = None
         with torch.autograd.profiler.record_function('input'):
@@ -555,6 +556,7 @@ class Generator(torch.nn.Module):
         synthesis_kwargs    = {},     # Arguments for SynthesisNetwork.
         mix_prob            = 0.9,
         condition_const     = False,
+        z_dim               = 512,
         epilogue_kwargs     = {},     # Arguments for DiscriminatorEpilogue.
     ):
         super().__init__()
@@ -569,13 +571,24 @@ class Generator(torch.nn.Module):
         # self.fine_img_mapping = ImgMappingNetwork(
         #     w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, num_ws=self.num_ws, epilogue_kwargs=epilogue_kwargs, **mapping_kwargs)
 
-        self.fine_img_mapping = ImgMappingNetwork(w_dim=w_dim, img_channels=img_channels, num_ws=self.num_ws)
+        self.img_mapping = ImgMappingNetwork(w_dim=w_dim, img_channels=img_channels, num_ws=self.num_ws)
+        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=0, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
-    def style_mixing(self, fine_img):
-        ws = self.fine_img_mapping(fine_img)
-        # cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
-        # cutoff = torch.where(torch.rand([], device=ws.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
-        # ws[:, cutoff:] = self.mapping_b(torch.randn_like(z), b, skip_w_avg_update=True)[:, cutoff:]
+    def get_latent(self, fine_img, z, mix_style=True):
+        if fine_img is None:
+            if mix_style:
+                ws = self.style_mixing(z=z)
+            else:
+                ws = self.mapping(z)
+        else:
+            ws = self.img_mapping(fine_img)
+        return ws
+
+    def style_mixing(self, z):
+        ws = self.mapping(z)
+        cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+        cutoff = torch.where(torch.rand([], device=ws.device) < self.mix_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
+        ws[:, cutoff:] = self.mapping(torch.randn_like(z), skip_w_avg_update=True)[:, cutoff:]
         return ws
 
     def generate(self, ws, **synthesis_kwargs):
@@ -583,12 +596,8 @@ class Generator(torch.nn.Module):
         style_img = skip_li[-1]
         return style_img
 
-    def forward(self, fine_img, mix_style=False, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-        if mix_style:
-            ws = self.style_mixing(fine_img)
-        else:
-            ws = self.fine_img_mapping(fine_img)
-
+    def forward(self, fine_img=None, z=None, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        ws = self.get_latent(fine_img, z, mix_style)
         style_img = self.generate(ws=ws, **synthesis_kwargs)
         return style_img
 
@@ -1090,10 +1099,10 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
     def forward(self, x):
@@ -1189,11 +1198,10 @@ class ImgMappingNetwork(torch.nn.Module):
         w_dim,                          # Intermediate latent (W) dimensionality.
         img_channels,                   # Number of input color channels.
         num_ws,                         # Number of intermediate latents to output, None = do not broadcast.
-        w_avg_beta      = 0.995,    # Decay for tracking the moving average of W during training, None = do not track.
     ):
         super().__init__()
         self.num_ws = num_ws
-        self.w_avg_beta = w_avg_beta
+        self.w_dim = w_dim
 
         self.inc = DoubleConv(img_channels, 64)
         self.down1 = Down(64, 128)
@@ -1205,18 +1213,15 @@ class ImgMappingNetwork(torch.nn.Module):
         #     nn.Conv2d(512, 512,  kernel_size=4, stride=4),
         #     nn.ReLU(inplace=True))
         self.fc1 = nn.Sequential(
-            nn.Linear(512 * 4 * 4, w_dim),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True))
+            nn.Linear(512 * 4 * 4, w_dim * num_ws),
+            nn.BatchNorm1d(w_dim * num_ws),
+            nn.LeakyReLU(0.2, inplace=True))
         self.fc2 = nn.Sequential(
-            nn.Linear(w_dim, w_dim),
-            nn.BatchNorm1d(w_dim),
-            nn.ReLU(inplace=True))
+            nn.Linear(w_dim * num_ws, w_dim * num_ws),
+            nn.BatchNorm1d(w_dim * num_ws),
+            nn.LeakyReLU(0.2, inplace=True))
 
-        if num_ws is not None and w_avg_beta is not None:
-            self.register_buffer('w_avg', torch.zeros([w_dim]))
-
-    def forward(self, img, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
+    def forward(self, img):
         x = self.inc(img)
         x = self.down1(x)  # 64 x 64
         x = self.down2(x)  # 32 x 32
@@ -1226,26 +1231,7 @@ class ImgMappingNetwork(torch.nn.Module):
         # x = self.down6(x)  # 1 x 1
         x = self.fc1(x.view(x.size(0), -1))
         x = self.fc2(x)
-        # x = x.view(x.size(0), -1)
-        # Update moving average of W.
-        if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
-            with torch.autograd.profiler.record_function('update_w_avg'):
-                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
-
-        # Broadcast.
-        if self.num_ws is not None:
-            with torch.autograd.profiler.record_function('broadcast'):
-                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
-
-        # Apply truncation.
-        if truncation_psi != 1:
-            with torch.autograd.profiler.record_function('truncate'):
-                assert self.w_avg_beta is not None
-                if self.num_ws is None or truncation_cutoff is None:
-                    x = self.w_avg.lerp(x, truncation_psi)
-                else:
-                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
-        return x
+        return x.view(x.size(0), self.num_ws, self.w_dim)
 
 #----------------------------------------------------------------------------
 
