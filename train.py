@@ -3,7 +3,7 @@ import math
 import random
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import numpy as np
 import torch
@@ -13,9 +13,10 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
-from model import Generator, Discriminator
+from model import Generator, Discriminator, G_NET
 
 import wandb
+import dnnlib
 
 from dataset import MultiResolutionDataset
 from prepare_data import IMIM
@@ -125,7 +126,7 @@ def sample_codes(batch, z_dim, b_dim, p_dim, c_dim, device):
     b = c.clone()
     return z, b, p, c
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, fine_generator, generator, discriminator, g_optim, d_optim, g_ema, vgg16, device):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -160,8 +161,6 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         ada_augment = AdaptiveAugment(
             args.ada_target, args.ada_length, 8, device)
 
-    # sample_z = torch.randn(args.n_sample, args.w_dim, device=device)
-
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -173,11 +172,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         real_img, _ = next(loader)
         real_img = real_img.to(device)
 
+        ############# train child discriminator #############
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-        fake_img, _ = generator(z)
+        fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+        with torch.no_grad():
+            fine_img = fine_generator(fine_z, b, p, c)
+        fake_img, _ = generator(z=None, fine_img=fine_img)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -224,30 +226,52 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         loss_dict["r1"] = r1_loss
 
+
+        ############# train generator #############
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        z, _, _, _ = sample_codes(args.batch, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-        fake_img, _ = generator(z)
+        fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+        with torch.no_grad():
+            fine_img = fine_generator(fine_z, b, p, c)
+        fake_img, _ = generator(z=None, fine_img=fine_img)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
+        # fine loss
+        if args.use_fine_loss:
+            _fine_img = F.interpolate(fine_img, size=(256, 256), mode='area')
+            _synth_img = F.interpolate(fake_img, size=(256, 256), mode='area')
+            target_features = vgg16(_fine_img, resize_images=False, return_lpips=True)
+            synth_features = vgg16(_synth_img, resize_images=False, return_lpips=True)
+            fine_loss = (target_features - synth_features).square().sum()
+        else:
+            fine_loss = torch.zeros(1, device=device)
+
+        loss_dict["fine"] = fine_loss
+
+        # child rf
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
 
+        generator_loss = g_loss + fine_loss
+
         generator.zero_grad()
-        g_loss.backward()
+        generator_loss.backward()
         g_optim.step()
 
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
-            z, _, _, _ = sample_codes(path_batch_size, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-            fake_img, latents = generator(z, return_latents=True)
+
+            fine_z, b, p, c = sample_codes(path_batch_size, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+            with torch.no_grad():
+                fine_img = fine_generator(fine_z, b, p, c)
+            fake_img, latents = generator(z=None, fine_img=fine_img, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -276,6 +300,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
+        fine_loss_val = loss_reduced["fine"].mean().item()
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
@@ -285,8 +310,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
+                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; fine: {fine_loss_val:.4f}; "
+                    f"r1: {r1_val:.4f}; path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
                     f"augment: {ada_aug_p:.4f}"
                 )
             )
@@ -296,6 +321,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     {
                         "Generator": g_loss_val,
                         "Discriminator": d_loss_val,
+                        "Fine": fine_loss_val,
                         "Augment": ada_aug_p,
                         "Rt": r_t_stat,
                         "R1": r1_val,
@@ -310,18 +336,34 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if i % 1000 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    _sample = None
+                    _fine_img = None
+                    _style_img = None
                     for _ in range(4):
-                        z, _, _, _ = sample_codes(8, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-                        sample, _ = g_ema(z)
-                        if _sample is None:
-                            _sample = sample
+                        fine_z, b, p, c = sample_codes(8, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                        fine_img = fine_generator(fine_z, b, p, c)
+                        style_img, _ = g_ema(z=None, fine_img=fine_img)
+
+                        if _style_img is None:
+                            _style_img = style_img
                         else:
-                            _sample = torch.cat([_sample, sample])
+                            _style_img = torch.cat([_style_img, style_img])
+
+                        if _fine_img is None:
+                            _fine_img = fine_img
+                        else:
+                            _fine_img = torch.cat([_fine_img, fine_img])
 
                     utils.save_image(
-                        _sample,
-                        f"sample/{str(i).zfill(6)}.png",
+                        _fine_img,
+                        f"sample/{str(i).zfill(6)}_0.png",
+                        nrow=8,
+                        normalize=True,
+                        range=(-1, 1),
+                    )
+
+                    utils.save_image(
+                        _style_img,
+                        f"sample/{str(i).zfill(6)}_1.png",
                         nrow=8,
                         normalize=True,
                         range=(-1, 1),
@@ -463,6 +505,10 @@ if __name__ == "__main__":
     args.p_dim = 20
     args.c_dim = 200
 
+    args.use_fine_loss = False
+    args.fine_model = '../../../disk1/yang_data/fine_model/fine_models.pt'
+    args.vgg_model = '../../../disk1/yang_data/fine_model/vgg16.pt'
+
     args.start_iter = 0
 
     generator = Generator(
@@ -502,6 +548,22 @@ if __name__ == "__main__":
         lr=args.lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
+
+    # Load finegan
+    fine_generator = G_NET()
+    fine_generator = torch.nn.DataParallel(fine_generator, device_ids=[0])
+    state_dict = torch.load(args.fine_model, map_location=lambda storage, loc: storage)
+    fine_generator.load_state_dict(state_dict['birds128'])
+    fine_generator.eval()
+
+    # Load VGG16 feature detector.
+    # url = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/vgg16.pt'
+    # with dnnlib.util.open_url(url) as f:
+    #     vgg16 = torch.jit.load(f).eval().to(device)
+    if args.use_fine_loss:
+        vgg16 = torch.jit.load(args.vgg_model).eval().to(device)
+    else:
+        vgg16 = None
 
     if args.ckpt is not None:
         print("load model:", args.ckpt)
@@ -557,5 +619,5 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="super res ros")
 
-    train(args, loader, generator, discriminator,
-          g_optim, d_optim, g_ema, device)
+    train(args, loader, fine_generator, generator, discriminator,
+          g_optim, d_optim, g_ema, vgg16, device)
