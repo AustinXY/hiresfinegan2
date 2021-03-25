@@ -353,23 +353,32 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
             if i % 1000 == 0:
                 with torch.no_grad():
-                    g_ema.eval()
+                    g_ema.train()
                     _fine_img = None
+                    _synth_img = None
                     _style_img = None
                     for _ in range(4):
                         fine_z, b, p, c = sample_codes(8, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
                         fine_img = fine_generator(fine_z, b, p, c)
-                        style_img, _ = g_ema(z=None, fine_img=fine_img)
+                        synth_img, _ = g_ema(z=None, fine_img=fine_img)
 
-                        if _style_img is None:
-                            _style_img = style_img
-                        else:
-                            _style_img = torch.cat([_style_img, style_img])
+                        z, _, _, _ = sample_codes(8, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
+                        style_img, _ = generator(z=z, fine_img=None)
 
                         if _fine_img is None:
                             _fine_img = fine_img
                         else:
                             _fine_img = torch.cat([_fine_img, fine_img])
+
+                        if _synth_img is None:
+                            _synth_img = synth_img
+                        else:
+                            _synth_img = torch.cat([_synth_img, synth_img])
+
+                        if _style_img is None:
+                            _style_img = style_img
+                        else:
+                            _style_img = torch.cat([_style_img, style_img])
 
                     utils.save_image(
                         _fine_img,
@@ -380,14 +389,22 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                     )
 
                     utils.save_image(
-                        _style_img,
+                        _synth_img,
                         f"sample/{str(i).zfill(6)}_1.png",
                         nrow=8,
                         normalize=True,
                         range=(-1, 1),
                     )
 
-            if i % 100000 == 0 and i != 0:
+                    utils.save_image(
+                        _style_img,
+                        f"sample/{str(i).zfill(6)}_2.png",
+                        nrow=8,
+                        normalize=True,
+                        range=(-1, 1),
+                    )
+
+            if i % 20000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -524,7 +541,7 @@ if __name__ == "__main__":
     args.c_dim = 200
 
     args.use_fine_loss = False
-    args.fine_train_every = 5  # if 1 then no random sample z training
+    args.fine_train_every = 1000  # if 1 then no random sample z training
     args.fine_model = '../../../disk1/yang_data/fine_model/fine_models.pt'
     args.vgg_model = '../../../disk1/yang_data/fine_model/vgg16.pt'
 
