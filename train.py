@@ -3,7 +3,7 @@ import math
 import random
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import numpy as np
 import torch
@@ -363,7 +363,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                         synth_img, _ = g_ema(z=None, fine_img=fine_img)
 
                         z, _, _, _ = sample_codes(8, args.z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-                        style_img, _ = generator(z=z, fine_img=None)
+                        style_img, _ = g_ema(z=z, fine_img=None)
 
                         if _fine_img is None:
                             _fine_img = fine_img
@@ -404,7 +404,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                         range=(-1, 1),
                     )
 
-            if i % 20000 == 0 and i != 0:
+            if i % 50000 == 0 and i != 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
