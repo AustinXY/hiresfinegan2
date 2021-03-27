@@ -325,7 +325,6 @@ class NoiseInjection(nn.Module):
 class ConstantInput(nn.Module):
     def __init__(self, channel, size=4):
         super().__init__()
-
         self.input = nn.Parameter(torch.randn(1, channel, size, size))
 
     def forward(self, input):
@@ -442,6 +441,7 @@ class Generator(nn.Module):
         channel_multiplier = 2,
         blur_kernel        = [1, 3, 3, 1],
         lr_mlp             = 0.01,
+        map_const          = False,
     ):
         super().__init__()
 
@@ -468,7 +468,11 @@ class Generator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        self.input = ConstantInput(self.channels[4])
+        if map_const:
+            self.input = ConstMappingNetwork(self.channels[4])
+        else:
+            self.input = ConstantInput(self.channels[4])
+
         self.conv1 = StyledConv(
             self.channels[4], self.channels[4], 3, w_dim, blur_kernel=blur_kernel
         )
@@ -565,13 +569,14 @@ class Generator(nn.Module):
                 noise = [
                     getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
                 ]
-        if z is not None:
-            latent = self.style_mixing(z, mix_styles, truncation=truncation, truncation_latent=truncation_latent)
-        else:
-            assert fine_img is not None
-            latent = self.img_mapping(fine_img)
+        # if z is not None:
+        #     latent = self.style_mixing(z, mix_styles, truncation=truncation, truncation_latent=truncation_latent)
+        # else:
+        assert z is None
+        assert fine_img is not None
+        latent = self.img_mapping(fine_img)
 
-        out = self.input(latent)
+        out = self.input(fine_img)
         out = self.conv1(out, latent[:, 0], noise=noise[0])
 
         skip = self.to_rgb1(out, latent[:, 1])
@@ -782,6 +787,33 @@ class ImgMappingNetwork(nn.Module):
         x = self.final_linear(x.view(x.size(0), -1))
         return x.view(x.size(0), self.num_ws, self.w_dim)
 
+#----------------------------------------------------------------------------
+
+class ConstMappingNetwork(nn.Module):
+    def __init__(self, num_const):
+        super().__init__()
+        self.inc = nn.Sequential(
+            ConvLayer(3, 64, 3, activate=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.down1 = DoubleConv(64, 128)
+        self.down2 = DoubleConv(128, 256)
+        self.down3 = DoubleConv(256, 512)
+        self.down4 = DoubleConv(512, 512)
+        self.down5 = DoubleConv(512, num_const)
+
+    def forward(self, input):
+        x = self.inc(input)
+        x = self.down1(x)  # 64 x 64
+        x = self.down2(x)  # 32 x 32
+        x = self.down3(x)  # 16 x 16
+        x = self.down4(x)  # 8 x 8
+        x = self.down5(x)  # 4 x 4
+        # # x = self.down6(x)  # 1 x 1
+        # x = self.final_linear(x.view(x.size(0), -1))
+        # return x.view(x.size(0), self.num_ws, self.w_dim)
+        return x
 
 #----------------------------------------------------------------------------
 
