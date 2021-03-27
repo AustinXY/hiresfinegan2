@@ -3,7 +3,7 @@ import math
 import random
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import numpy as np
 import torch
@@ -115,18 +115,9 @@ def child_to_parent(c_code, c_dim, p_dim):
         p_code[i][pid[i]] = 1
     return p_code
 
-def sample_codes(batch, z_dim, b_dim, p_dim, c_dim, device):
+def sample_codes(batch, z_dim, device):
     z = torch.randn(batch, z_dim, device=device)
-    c = b = p = None
-    if c_dim > 0:
-        c = torch.zeros(batch, c_dim, device=device)
-        cid = np.random.randint(c_dim, size=batch)
-        for i in range(batch):
-            c[i, cid[i]] = 1
-
-        p = child_to_parent(c, c_dim, p_dim)
-        b = c.clone()
-    return z, b, p, c
+    return z
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
@@ -178,7 +169,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
+        z = sample_codes(args.batch, args.z_dim, device)
         fake_img, _ = generator(z)
 
         if args.augment:
@@ -231,7 +222,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
+        z = sample_codes(args.batch, args.z_dim, device)
         fake_img, _ = generator(z)
 
         if args.augment:
@@ -252,7 +243,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
 
-            z, _, _, _ = sample_codes(path_batch_size, args.z_dim, 0, 0, 0, device)
+            z = sample_codes(path_batch_size, args.z_dim, device)
             fake_img, latents = generator(z, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -318,7 +309,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     g_ema.eval()
                     _style_img = None
                     for _ in range(4):
-                        z, _, _, _ = sample_codes(8, args.z_dim, 0, 0, 0, device)
+                        z = sample_codes(8, args.z_dim, device)
                         style_img, _ = g_ema(z)
 
                         if _style_img is None:
