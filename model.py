@@ -571,17 +571,14 @@ class Generator(torch.nn.Module):
         # self.fine_img_mapping = ImgMappingNetwork(
         #     w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, num_ws=self.num_ws, epilogue_kwargs=epilogue_kwargs, **mapping_kwargs)
 
-        self.img_mapping = ImgMappingNetwork(w_dim=w_dim, img_channels=img_channels, num_ws=self.num_ws)
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=0, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
-    def get_latent(self, fine_img, z, mix_style=True):
-        if fine_img is None:
-            if mix_style:
-                ws = self.style_mixing(z=z)
-            else:
-                ws = self.mapping(z)
+    def get_latent(self, z, mix_style=True):
+        if mix_style:
+            ws = self.style_mixing(z=z)
         else:
-            ws = self.img_mapping(fine_img)
+            ws = self.mapping(z)
+
         return ws
 
     def style_mixing(self, z):
@@ -596,8 +593,8 @@ class Generator(torch.nn.Module):
         style_img = skip_li[-1]
         return style_img
 
-    def forward(self, fine_img=None, z=None, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-        ws = self.get_latent(fine_img, z, mix_style)
+    def forward(self, z, mix_style=True, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        ws = self.get_latent(z, mix_style)
         style_img = self.generate(ws=ws, **synthesis_kwargs)
         return style_img
 
@@ -1202,6 +1199,8 @@ class ImgMappingNetwork(torch.nn.Module):
         super().__init__()
         self.num_ws = num_ws
         self.w_dim = w_dim
+        print('not now')
+        sys.exit()
 
         self.inc = DoubleConv(img_channels, 64)
         self.down1 = Down(64, 128)

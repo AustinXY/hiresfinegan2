@@ -19,7 +19,7 @@ from torch_utils import image_transforms
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
-from model import Generator, Discriminator, G_NET
+from model import Generator, Discriminator
 
 # try:
 import wandb
@@ -28,7 +28,6 @@ import wandb
 #     wandb = None
 
 from dataset import MultiResolutionDataset
-from prepare_data import IMIM
 
 from distributed import (
     get_rank,
@@ -121,24 +120,6 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
 
     return path_penalty, path_mean.detach(), path_lengths
 
-
-# def make_noise(batch, latent_dim, n_noise, device):
-#     if n_noise == 1:
-#         return torch.randn(batch, latent_dim, device=device)
-
-#     noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0)
-
-#     return noises
-
-
-def mixing_noise(batch, latent_dim, c, G_mapping, device):
-    z = torch.randn(batch, latent_dim, device=device)
-    ws = G_mapping(z, c)
-    cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
-    cutoff = torch.where(torch.rand([], device=ws.device) < args.mixing, cutoff, torch.full_like(cutoff, ws.shape[1]))
-    ws[:, cutoff:] = G_mapping(torch.randn_like(z), c, skip_w_avg_update=True)[:, cutoff:]
-    return ws
-
 def set_grad_none(model, targets):
     for n, p in model.named_parameters():
         if n in targets:
@@ -153,25 +134,15 @@ def child_to_parent(c_code, c_dim, p_dim):
         p_code[i][pid[i]] = 1
     return p_code
 
-def sample_codes(batch, latent_dim, b_dim, p_dim, c_dim, device):
+def sample_codes(batch, latent_dim, device):
     z = torch.randn(batch, latent_dim, device=device)
-    if c_dim > 0:
-        c = torch.zeros(batch, c_dim, device=device)
-        cid = np.random.randint(c_dim, size=batch)
-        for i in range(batch):
-            c[i, cid[i]] = 1
-
-        p = child_to_parent(c, c_dim, p_dim)
-        b = c.clone()
-    else:
-        b = p = c = None
-    return z, b, p, c
+    return z
 
 def binarization_loss(mask):
     return torch.min(1-mask, mask).mean()
 
 
-def train(args, loader, fine_generator, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -214,7 +185,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
             print("Done!")
             break
 
-        real_img, _ = next(loader)
+        real_img = next(loader)
         real_img = real_img.to(device)
         # real_bbox = mask_to_bbox(real_mask, args.threshold)
         # real_pair = torch.cat((real_img, real_bbox), dim=1)
@@ -223,14 +194,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         generator.requires_grad_(False)
         discriminator.requires_grad_(True)
 
-        if i % args.fine_train_every == 0:
-            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-            with torch.no_grad():
-                fine_img = fine_generator(fine_z, b, p, c)
-            fake_img = generator(z=None, fine_img=fine_img)
-        else:
-            z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
-            fake_img = generator(z=z, fine_img=None)
+        z = sample_codes(args.batch, args.z_dim, device)
+        fake_img = generator(z)
 
         real_pred = discriminator(real_img)
         fake_pred = discriminator(fake_img)
@@ -273,26 +238,11 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
 
         ############# train generator #############
-        fine_generator.requires_grad_(False)
         generator.requires_grad_(True)
         discriminator.requires_grad_(False)
 
-        if i % args.fine_train_every == 0:
-            fine_z, b, p, c = sample_codes(args.batch, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-            with torch.no_grad():
-                fine_img = fine_generator(fine_z, b, p, c)
-            style_img = generator(z=None, fine_img=fine_img)
-        else:
-            z, _, _, _ = sample_codes(args.batch, args.z_dim, 0, 0, 0, device)
-            style_img = generator(z=z, fine_img=None)
-
-
-        fine_loss = torch.zeros(1, device=device)
-
-        loss_dict["fine"] = fine_loss
-
-        # if args.augment:
-        #     fake_img, _ = augment(fake_img, ada_aug_p)
+        z = sample_codes(args.batch, args.z_dim, device)
+        style_img = generator(z)
 
         # child rf
         fake_pred = discriminator(style_img)
@@ -300,14 +250,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
         loss_dict["g"] = g_loss
 
-        # fine loss
-        # resized_style_img = image_transforms.resize(
-        #     style_img, [fine_img.size(-1), fine_img.size(-1)])
-
-        generator_loss = g_loss + fine_loss
-
         generator.zero_grad()
-        generator_loss.backward()
+        g_loss.backward()
         g_optim.step()
 
         g_regularize = i % args.g_reg_every == 0
@@ -315,15 +259,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
 
-            if i % args.fine_train_every == 0:
-                fine_z, b, p, c = sample_codes(path_batch_size, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-                with torch.no_grad():
-                    fine_img = fine_generator(fine_z, b, p, c)
-                ws = generator.get_latent(fine_img=fine_img, z=None)
-            else:
-                z, _, _, _ = sample_codes(
-                    args.batch, args.z_dim, 0, 0, 0, device)
-                ws = generator.get_latent(fine_img=None, z=z)
+            z = sample_codes(path_batch_size, args.z_dim, device)
+            ws = generator.get_latent(z)
 
             fake_img = generator.generate(ws)
 
@@ -366,7 +303,6 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
         d_loss_val = loss_reduced["d"].mean().item()
         g_loss_val = loss_reduced["g"].mean().item()
-        fine_loss_val = loss_reduced["fine"].mean().item()
         r1_val = loss_reduced["r1"].mean().item()
         path_loss_val = loss_reduced["path"].mean().item()
         real_score_val = loss_reduced["real_score"].mean().item()
@@ -376,7 +312,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
         if get_rank() == 0:
             pbar.set_description(
                 (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; fine: {fine_loss_val:.4f}; "
+                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; r1: {r1_val:.4f}; "
                     f"augment: {ada_aug_p:.4f}"
                 )
@@ -387,7 +323,6 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                     {
                         "Generator": g_loss_val,
                         "Discriminator": d_loss_val,
-                        "Fine": fine_loss_val,
                         "Augment": ada_aug_p,
                         "Rt": r_t_stat,
                         "R1": r1_val,
@@ -403,17 +338,10 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                 with torch.no_grad():
                     g_ema.eval()
 
-                    _fine_img = None
                     _style_img = None
                     for _ in range(4):
-                        z, b, p, c = sample_codes(8, args.fine_z_dim, args.b_dim, args.p_dim, args.c_dim, device)
-                        fine_img = fine_generator(z, b, p, c)
-                        style_img = g_ema(fine_img, mix_style=False, noise_mode='const')
-
-                        if _fine_img is None:
-                            _fine_img = fine_img
-                        else:
-                            _fine_img = torch.cat([_fine_img, fine_img])
+                        z = sample_codes(8, args.z_dim, device)
+                        style_img = g_ema(z, mix_style=False, noise_mode='const')
 
                         if _style_img is None:
                             _style_img = style_img
@@ -421,15 +349,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
                             _style_img = torch.cat([_style_img, style_img])
 
                     utils.save_image(
-                        _fine_img,
-                        f"sample/{str(i).zfill(6)}_0.png",
-                        nrow=8,
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-                    utils.save_image(
                         _style_img,
-                        f"sample/{str(i).zfill(6)}_1.png",
+                        f"sample/{str(i).zfill(6)}.png",
                         nrow=8,
                         normalize=True,
                         range=(-1, 1),
@@ -588,24 +509,17 @@ if __name__ == "__main__":
     args.ema_kimg = 2.5
     args.ema_rampup = 0.05
 
-    args.threshold = 0.8
-    args.img_dim = 4
+    args.img_dim = 3
 
     args.start_iter = 0
 
-    args.b_dim = 200
-    args.p_dim = 20
-    args.c_dim = 200
-
-    args.fine_train_every = 10
-    args.fine_model = '../data/fine_model/fine_models.pt'
-    args.fine_wt = 0
+    # args.fine_train_every = 10
+    # args.fine_model = '../data/fine_model/fine_models.pt'
+    # args.fine_wt = 0
 
     if args.batch == 0:
         args.batch = spec.mb
     print('batch size: ', args.batch)
-
-    fine_generator = G_NET()
 
     generator = Generator(
         w_dim               = args.w_dim,               # Intermediate latent (W) dimensionality.
@@ -658,9 +572,6 @@ if __name__ == "__main__":
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
 
-    fine_generator = torch.nn.DataParallel(fine_generator, device_ids=[0])
-    state_dict = torch.load(args.fine_model, map_location=lambda storage, loc: storage)
-    fine_generator.load_state_dict(state_dict['birds128'])
 
     if args.ckpt is not None:
         print("load model:", args.ckpt)
@@ -711,6 +622,6 @@ if __name__ == "__main__":
     )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project="super res")
+        wandb.init(project="super res offi")
 
-    train(args, loader, fine_generator, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
