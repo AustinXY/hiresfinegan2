@@ -3,7 +3,7 @@ import math
 import random
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import numpy as np
 import torch
@@ -19,7 +19,6 @@ import wandb
 import dnnlib
 
 from dataset import MultiResolutionDataset
-from prepare_data import IMIM
 from distributed import (
     get_rank,
     synchronize,
@@ -146,6 +145,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
     loss_dict = {}
 
     log_fine_loss = None
+    l1_loss = nn.L1Loss()
 
     if args.distributed:
         g_module = generator.module
@@ -171,7 +171,7 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
 
             break
 
-        real_img, _ = next(loader)
+        real_img = next(loader)
         real_img = real_img.to(device)
 
         ############# train child discriminator #############
@@ -248,7 +248,8 @@ def train(args, loader, fine_generator, generator, discriminator, g_optim, d_opt
             # target_features = vgg16(_fine_img, resize_images=False, return_lpips=True)
             # synth_features = vgg16(_synth_img, resize_images=False, return_lpips=True)
             # fine_loss = (target_features - synth_features).square().sum()
-            fine_loss = ((fake_img - fine_img) ** 2).mean() * args.fine_wt
+            # fine_loss = ((fake_img - fine_img) ** 2).mean() * args.fine_wt
+            fine_loss = l1_loss(fake_img, fine_img) * args.fine_wt
             log_fine_loss = fine_loss
         else:
             fine_loss = torch.zeros(1, device=device)
@@ -530,10 +531,10 @@ if __name__ == "__main__":
     args.c_dim = 200
 
     args.use_fine_loss = True
-    args.fine_wt = 1e1
+    args.fine_wt = 1
     args.use_vgg = False
     # args.fine_train_every = 1000  # if 1 then no random sample z training
-    args.fine_model = '../../../disk1/yang_data/fine_model/fine_models.pt'
+    args.fine_model = '../data/fine_model/fine_models.pt'
     args.vgg_model = '../../../disk1/yang_data/fine_model/vgg16.pt'
 
     args.start_iter = 0
@@ -544,7 +545,8 @@ if __name__ == "__main__":
         w_dim               = args.w_dim,
         n_mlp               = args.n_mlp,
         mix_prob            = 0.9,
-        channel_multiplier  = args.channel_multiplier
+        channel_multiplier  = args.channel_multiplier,
+        map_const           = True,
     ).train().requires_grad_(False).to(device)
 
     discriminator = Discriminator(
@@ -552,12 +554,13 @@ if __name__ == "__main__":
     ).train().requires_grad_(False).to(device)
 
     g_ema = Generator(
-        img_resolution      = args.size,
-        z_dim               = args.z_dim,
-        w_dim               = args.w_dim,
-        n_mlp               = args.n_mlp,
-        mix_prob            = 0.9,
-        channel_multiplier  = args.channel_multiplier
+        img_resolution=args.size,
+        z_dim=args.z_dim,
+        w_dim=args.w_dim,
+        n_mlp=args.n_mlp,
+        mix_prob=0.9,
+        channel_multiplier=args.channel_multiplier,
+        map_const=True,
     ).train().requires_grad_(False).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
